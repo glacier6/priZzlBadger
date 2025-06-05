@@ -570,7 +570,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	}
 
 	keepTogether := true           // true为非托管模式，这个是在托管模式下用的东西，在这个模式下，单个事务可以有不同时间戳的条目，托管模式（managed mode）是干啥的还需要再看
-	setVersion := func(e *Entry) { //在KEY后拼接版本号，这里是一个闭包
+	setVersion := func(e *Entry) { //NOTE:重点，在KEY后拼接版本号，这里是一个闭包
 		if e.version == 0 {
 			e.version = commitTs
 		} else {

@@ -360,7 +360,7 @@ func Open(opt Options) (*DB, error) {
 	db.vlog.init(db) //NOTE:核心操作，初始化Vlog，就是在外存打开一个DISCARD的文件（用于GC）并关联为mmap文件
 
 	if !opt.ReadOnly {
-		// 下面是启动LSM Tree的日志归并的协程
+		// 下面是启动LSM Tree的日志归并的协程 NOTE:2025060500
 		db.closers.compactors = z.NewCloser(1)
 		db.lc.startCompact(db.closers.compactors) //NOTE:核心操作，启动日志合并
 
@@ -401,7 +401,7 @@ func Open(opt Options) (*DB, error) {
 	}
 
 	db.closers.writes = z.NewCloser(1)
-	go db.doWrites(db.closers.writes) //NOTE:核心操作,创建一个处理写请求的协程
+	go db.doWrites(db.closers.writes) //NOTE:核心操作,创建一个处理写请求的协程 NOTE:202506051
 
 	if !db.opt.InMemory { //开启GC
 		db.closers.valueGC = z.NewCloser(1)
@@ -956,7 +956,7 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	req.Entries = entries
 	req.Wg.Add(1)
 	req.IncrRef()     // for db write
-	db.writeCh <- req // Handled in doWrites.交给doWrites来处理
+	db.writeCh <- req // Handled in doWrites.交给doWrites来处理，跳到NOTE:202506051这里来看
 	y.NumPutsAdd(db.opt.MetricsEnabled, int64(len(entries)))
 
 	return req, nil

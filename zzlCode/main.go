@@ -8,9 +8,9 @@ import (
 )
 
 func main() {
-	// NOTE:下面是通用的一些方法
+	// NOTE:下面是通用的一些方法，总共需要看6个部分
 
-	// 打开DB
+	// 1.打开DB（DB初始化）
 	db, err := badger.Open(badger.DefaultOptions("/tmp/badger"))
 	if err != nil {
 		log.Fatal(err)
@@ -18,7 +18,7 @@ func main() {
 	}
 
 	defer db.Close()
-	// 读写事物
+	// 2.读写事物
 	// 在读写事务中允许所有数据库操作。
 	err = db.Update(func(txn *badger.Txn) error {
 		txn.Set([]byte("answer"), []byte("42"))
@@ -29,14 +29,14 @@ func main() {
 		err := txn.SetEntry(e)
 		return err
 	})
-	// 只读事务
+	// 3.只读事务
 	// 您不能在此事务中执行任何写入或删除。Badger 确保您在此闭包中获得一致的数据库视图。事务开始后在其他地方发生的任何写入, 都不会被闭包内的调用看到。
 	err = db.View(func(txn *badger.Txn) error {
 		txn.Get([]byte("answer"))
 		return nil
 	})
 
-	// 遍历keys（范围查询），貌似这个代码块没有设置前缀，所以，会把所有数据都返回，然后在下面这个函数参数内进行全部遍历
+	// 4.遍历keys（范围查询），貌似这个代码块没有设置前缀，所以，会把所有数据都返回，然后在下面这个函数参数内进行全部遍历
 	err = db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchSize = 10 //指定预读取的kv对个数
@@ -60,7 +60,7 @@ func main() {
 		}
 		return nil
 	})
-	// vlog 的GC
+	// 5.vlog 的GC
 	err = db.RunValueLogGC(0.7) //脏键百分比0.7
 	_ = err
 
@@ -83,4 +83,7 @@ func main() {
 	if err2 := txn.Commit(); err2 != nil {
 		//抛出错误
 	}
+
+	// 6.LSM日志合并
+	// NOTE:2025060500
 }
