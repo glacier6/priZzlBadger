@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	badger "github.com/dgraph-io/badger/v4"
 )
@@ -11,35 +12,34 @@ func main() {
 	// NOTE:下面是通用的一些方法，总共需要看6个部分
 
 	// 1.打开DB（DB初始化）
-	db, err := badger.Open(badger.DefaultOptions("/tmp/badger"))
+	db, err := badger.Open(badger.DefaultOptions("/home/hanjiang/DB-CODE/ZZLdgraph/dgraph/p"))
 	if err != nil {
 		log.Fatal(err)
-
 	}
-
 	defer db.Close()
-	// 2.读写事物
-	// 在读写事务中允许所有数据库操作。
-	err = db.Update(func(txn *badger.Txn) error {
-		txn.Set([]byte("answer"), []byte("42"))
-		txn.Get([]byte("answer"))
 
-		// 或者下面这种set方式
-		e := badger.NewEntry([]byte("answer"), []byte("42"))
-		err := txn.SetEntry(e)
-		return err
-	})
-	// 3.只读事务
-	// 您不能在此事务中执行任何写入或删除。Badger 确保您在此闭包中获得一致的数据库视图。事务开始后在其他地方发生的任何写入, 都不会被闭包内的调用看到。
-	err = db.View(func(txn *badger.Txn) error {
-		txn.Get([]byte("answer"))
-		return nil
-	})
+	// // 2.读写事物
+	// // 在读写事务中允许所有数据库操作。
+	// err = db.Update(func(txn *badger.Txn) error {
+	// 	txn.Set([]byte("answer"), []byte("42"))
+	// 	txn.Get([]byte("answer"))
+
+	// 	// 或者下面这种set方式
+	// 	e := badger.NewEntry([]byte("answer"), []byte("42"))
+	// 	err := txn.SetEntry(e)
+	// 	return err
+	// })
+	// // 3.只读事务
+	// // 您不能在此事务中执行任何写入或删除。Badger 确保您在此闭包中获得一致的数据库视图。事务开始后在其他地方发生的任何写入, 都不会被闭包内的调用看到。
+	// err = db.View(func(txn *badger.Txn) error {
+	// 	txn.Get([]byte("answer"))
+	// 	return nil
+	// })
 
 	// 4.遍历keys（范围查询），貌似这个代码块没有设置前缀，所以，会把所有数据都返回，然后在下面这个函数参数内进行全部遍历
 	err = db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchSize = 10 //指定预读取的kv对个数
+		opts.PrefetchSize = 100 //指定预读取的kv对个数
 
 		// opts.PrefetchValues = false // NOTE:注意上面那一行删掉，然后本行打开，就会变成仅键迭代模式，具体如下
 		// Badger 支持一种独特的迭代模式, 称为key-only迭代。它比常规迭代快几个数量级, 因为它只涉及对 LSM 树的访问, 它通常完全驻留在 RAM 中。要启用仅键迭代, 您需要将该IteratorOptions.PrefetchValues 字段设置为false.
@@ -47,11 +47,17 @@ func main() {
 
 		it := txn.NewIterator(opts) //NOTE:核心操作，这个顶级迭代器屏蔽了数据可能在内存，也可能在外存，也可能在事务中，统一进行遍历
 		defer it.Close()
+		fmt.Printf("| %-*s | %s |\n", 40, "KEY", "VALUE")
+		fmt.Printf("|%s|%s|\n", strings.Repeat("-", 40+2), strings.Repeat("-", 20+2))
 		for it.Rewind(); it.Valid(); it.Next() { // Rewind把指针指向遍历的初始位置以及一些初始操作（核心函数），Valid判断当前kv是否有效，Next将指针指向下一个kv
 			item := it.Item() // 取出当前遍历器指向的kv
 			k := item.Key()
 			err := item.Value(func(v []byte) error {
-				fmt.Printf("key=%s, value=%s\n", k, v) //输出取出来的kv对
+				fmt.Printf("| %-*s | %s \n", 40, cleanString(k), cleanString(v))
+				fmt.Print(k)
+				fmt.Print("------")
+				fmt.Print(v)
+				fmt.Printf("\n")
 				return nil
 			})
 			if err != nil {
@@ -61,8 +67,8 @@ func main() {
 		return nil
 	})
 	// 5.vlog 的GC
-	err = db.RunValueLogGC(0.7) //脏键百分比0.7
-	_ = err
+	// err = db.RunValueLogGC(0.7) //脏键百分比0.7
+	// _ = err
 
 	//	NOTE:下面是另一种实现事务查询的方式
 
@@ -75,15 +81,25 @@ func main() {
 	// 但是, 如果由于某种原因没有调用 Txn.Commit()(例如, 它过早地返回错误), 那么请确保您Txn.Discard()在一个defer块中调用, 如:
 
 	// Start a writable transaction.
-	txn := db.NewTransaction(true)
-	defer txn.Discard()
-	if err1 := txn.Set([]byte("answer"), []byte("42")); err1 != nil {
-		//抛出错误
-	}
-	if err2 := txn.Commit(); err2 != nil {
-		//抛出错误
-	}
+	// txn := db.NewTransaction(true)
+	// defer txn.Discard()
+	// if err1 := txn.Set([]byte("answer"), []byte("42")); err1 != nil {
+	// 	//抛出错误
+	// }
+	// if err2 := txn.Commit(); err2 != nil {
+	// 	//抛出错误
+	// }
 
 	// 6.LSM日志合并
 	// NOTE:2025060500
+}
+
+// formatKV 格式化一维字节切片的 KV 对
+func cleanString(b []byte) string {
+	str := string(b)
+	str = strings.TrimSpace(str)             // 去除首尾空白
+	str = strings.ReplaceAll(str, "\t", " ") // 替换制表符为空格
+	str = strings.ReplaceAll(str, "\"", "")  // 去除引号
+	str = strings.ReplaceAll(str, "\n", " ") // 替换换行符为空格
+	return str
 }
