@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"unicode"
 
 	badger "github.com/dgraph-io/badger/v4"
 )
@@ -53,10 +54,12 @@ func main() {
 			item := it.Item() // 取出当前遍历器指向的kv
 			k := item.Key()
 			err := item.Value(func(v []byte) error {
-				fmt.Printf("| %-*s | %s \n", 40, cleanString(k), cleanString(v))
+				fmt.Printf("| %-*s | %s \n", 40, filterAlphanumeric(k), filterAlphanumeric(v))
 				fmt.Print(k)
 				fmt.Print("------")
 				fmt.Print(v)
+				fmt.Printf("\n")
+				fmt.Printf("\n")
 				fmt.Printf("\n")
 				return nil
 			})
@@ -102,4 +105,15 @@ func cleanString(b []byte) string {
 	str = strings.ReplaceAll(str, "\"", "")  // 去除引号
 	str = strings.ReplaceAll(str, "\n", " ") // 替换换行符为空格
 	return str
+}
+func filterAlphanumeric(bytes []byte) string {
+	var result []rune
+	for _, b := range bytes {
+		// 判断是否为字母或数字（Unicode 范围）
+		if unicode.IsLetter(rune(b)) || unicode.IsDigit(rune(b)) ||
+			b == '.' || b == '-' || b == '_' {
+			result = append(result, rune(b))
+		}
+	}
+	return string(result)
 }
