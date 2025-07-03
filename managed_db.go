@@ -55,6 +55,9 @@ func (db *DB) NewManagedWriteBatch() *WriteBatch {
 //
 // This is only useful for databases built on top of Badger (like Dgraph), and
 // can be ignored by most users.
+// CommitAt 提交事务，遵循与 Commit () 相同的逻辑，但使用给定的提交时间戳
+// 若未与托管事务配合使用，此操作将引发 panic
+// 此功能仅对基于 Badger 构建的数据库（如 Dgraph）有用，大多数用户可忽略此函数
 func (txn *Txn) CommitAt(commitTs uint64, callback func(error)) error {
 	if !txn.db.opt.managedTxns {
 		panic("Cannot use CommitAt with managedDB=false. Use Commit instead.")

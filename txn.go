@@ -182,7 +182,7 @@ func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
 		o.nextTxnTs++
 		o.txnMark.Begin(ts) //正式进入提交阶段，badger把整个事务分为读取阶段以及提交阶段
 
-	} else {
+	} else { // 如果是托管模式，直接赋值commitTS
 		// If commitTs is set, use it instead.
 		ts = txn.commitTs
 	}
