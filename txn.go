@@ -98,7 +98,7 @@ func (o *oracle) readTs() uint64 { // 利用时间辍作事务的版本号
 	// process. Not waiting here could mean that some txns which have been
 	// committed would not be read.
 
-	// 等待所有已分配提交时间戳并且正在进行写值日志和LSM树过程落盘的txn（判断标准是比当前读时间戳小的txn）。
+	// NOTE:核心操作，等待所有已分配提交时间戳并且正在进行写值日志和LSM树过程落盘的txn（判断标准是比当前读时间戳小的txn）。
 	// 不在这里等待可能意味着一些已提交的txn将不会被读取，即读取到旧版本的数据
 	y.Check(o.txnMark.WaitForMark(context.Background(), readTs))
 	// txnMarkt 字段是 WaterMark 结构体类型，它内部会维护一个堆数据结构，可以用于跟踪事务的时间戳区段的变化通知。
@@ -266,8 +266,8 @@ type Txn struct {
 	conflictKeys map[uint64]struct{} //记录当前事务修改了哪些KEY（同样记录的是key的hash值），用于冲突检查
 	readsLock    sync.Mutex          // guards the reads slice. See addReadKey.
 
-	pendingWrites   map[string]*Entry // cache stores any writes done by txn.
-	duplicateWrites []*Entry          // Used in managed mode to store duplicate entries.
+	pendingWrites   map[string]*Entry // cache stores any writes done by txn. 记录本事务写入的KV对（在托管模式下同key但是不同版本的这里只存最新的版本，旧版本的会存储在duplicateWrites里面）
+	duplicateWrites []*Entry          // Used in managed mode to store duplicate entries. 记录本事务同key不同版本KV对的旧版
 
 	numIterators atomic.Int32
 	discarded    bool
@@ -408,7 +408,7 @@ func (txn *Txn) modify(e *Entry) error {
 	// If a duplicate entry was inserted in managed mode, move it to the duplicate writes slice.
 	// Add the entry to duplicateWrites only if both the entries have different versions. For
 	// same versions, we will overwrite the existing entry.
-	// 如果在托管模式下插入了重复条目，请将其移动到重复写入切片。仅当两个条目具有不同版本时，才将条目添加到duplicateWrites。对于相同的版本，我们将覆盖现有条目。
+	// 如果在托管模式下插入了重复条目，请将其移动到duplicateWrites切片。仅当两个条目具有不同版本时，才将条目添加到duplicateWrites。对于相同的版本，我们将覆盖现有条目。（注意版本号与key的合并是在commit的时候才会进行，所以这里的key并不会包含版本号）
 	if oldEntry, ok := txn.pendingWrites[string(e.Key)]; ok && oldEntry.version != e.version { //如果在托管模式下，若同一个key 写入了两次（但是版本号不一样），那么就把老版本的放到下面这个计算重复写入的数组里面
 		txn.duplicateWrites = append(txn.duplicateWrites, oldEntry) // 因为如果不放入的话，老版就会被覆盖清理掉
 	}
@@ -579,7 +579,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 
 	entries := make([]*Entry, 0, len(txn.pendingWrites)+len(txn.duplicateWrites)+1)
 
-	processEntry := func(e *Entry) { // 使Entry存储的 key 绑定 commitTs（Entry是存储单个kv对的数据结构）
+	processEntry := func(e *Entry) { // NOTE:核心操作，使Entry存储的 key 绑定 commitTs（Entry是存储单个kv对的数据结构）
 		// Suffix the keys with commit ts, so the key versions are sorted in
 		// descending order of commit timestamp.
 		e.Key = y.KeyWithTs(e.Key, e.version)
@@ -601,6 +601,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	// var b strings.Builder
 	// fmt.Fprintf(&b, "Read: %d. Commit: %d. reads: %v. writes: %v. Keys: ",
 	// 	txn.readTs, commitTs, txn.reads, txn.conflictKeys)
+	// 下面这两个for循环，为key绑定提交时间戳与设置事务标记，以及整合pendingWrites和duplicateWrites到entries
 	for _, e := range txn.pendingWrites {
 		processEntry(e)
 	}
@@ -610,6 +611,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 
 	if keepTogether {
 		// CommitTs should not be zero if we're inserting transaction markers.
+		// 如果我们要插入事务标记（transaction markers），那么 CommitTs 不应该为零。
 		y.AssertTrue(commitTs != 0)
 		e := &Entry{
 			Key:   y.KeyWithTs(txnKey, commitTs),
@@ -618,6 +620,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		}
 		entries = append(entries, e)
 	}
+
 	// entries 是pendingWrites与duplicateWrites两个缓冲区经过处理（如为key绑定commitTs）后的合并体
 	req, err := txn.db.sendToWriteCh(entries) //NOTE:核心操作，进行落盘操作，req是返回的回调函数
 	if err != nil {                           //报错了

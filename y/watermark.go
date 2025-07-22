@@ -102,14 +102,14 @@ func (w *WaterMark) LastIndex() uint64 {
 
 // WaitForMark waits until the given index is marked as done.
 func (w *WaterMark) WaitForMark(ctx context.Context, index uint64) error {
-	if w.DoneUntil() >= index { //如果当前已提交的最大事务时间戳大于等于当前创建的readTs时间戳，则返回就可以了，否则就往后执行，等满足了再唤醒
+	if w.DoneUntil() >= index { //如果当前已提交的最大事务时间戳大于等于当前创建的readTs时间戳，则直接返回就可以了，否则就阻塞，等满足了再唤醒
 		return nil
 	}
 	waitCh := make(chan struct{})
-	w.markCh <- mark{index: index, waiter: waitCh}
+	w.markCh <- mark{index: index, waiter: waitCh} // 处理在 NOTE:2025072100
 
 	select {
-	case <-ctx.Done():
+	case <-ctx.Done(): // 当事务取消了
 		return ctx.Err()
 	case <-waitCh:
 		return nil
@@ -130,7 +130,7 @@ func (w *WaterMark) process(closer *z.Closer) {
 	var indices uint64Heap
 	// pending maps raft proposal index to the number of pending mutations for this proposal.
 	pending := make(map[uint64]int)
-	waiters := make(map[uint64][]chan struct{})
+	waiters := make(map[uint64][]chan struct{}) // 等待列表（键是readTS，值为用于通知读可以继续进行的阻塞通道）
 
 	heap.Init(&indices) // 初始化堆
 
@@ -203,11 +203,11 @@ func (w *WaterMark) process(closer *z.Closer) {
 		select {
 		case <-closer.HasBeenClosed():
 			return
-		case mark := <-w.markCh:
+		case mark := <-w.markCh: // NOTE:2025072100 处理事务之间并发顺序的通道！！事务写完成时标记commit完成，以及read时对正在进行事务的等待都会到这里
 			if mark.waiter != nil {
 				doneUntil := w.doneUntil.Load() // 获取已提交事务的水位（水位是和时间戳同一类型的东西，表示在其之前的时间戳（即版本）均已提交）
 				if doneUntil >= mark.index {    //诺已提交事务的时间戳大于等于当前时间戳，就可以直接close，不用等待
-					close(mark.waiter)
+					close(mark.waiter) // 注意close也会解除通道阻塞
 				} else { //当前时间戳大于当前已提交事务的时间戳，表明当前事务前还有活跃的事物
 					ws, ok := waiters[mark.index] //创建等待数组
 					if !ok {

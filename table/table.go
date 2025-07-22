@@ -677,6 +677,7 @@ func (t *Table) StaleDataSize() uint32 { return t.fetchIndex().StaleDataSize() }
 func (t *Table) Smallest() []byte { return t.smallest }
 
 // Biggest is its biggest key, or nil if there are none
+// Biggest 是其最大的键，若不存在任何键则为 nil
 func (t *Table) Biggest() []byte { return t.biggest }
 
 // Filename is NOT the file name.  Just kidding, it is.

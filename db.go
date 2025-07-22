@@ -876,7 +876,7 @@ func (db *DB) writeRequests(reqs []*request) error { //批量处理写请求
 		}
 	}
 	db.opt.Debugf("writeRequests called. Writing to value log")
-	err := db.vlog.write(reqs) // NOTE:核心操作，写入VLOG
+	err := db.vlog.write(reqs) // NOTE:核心操作，将大KV对写入VLOG，并得到VLOG偏移量，方便下面可以写入LSM树中
 	if err != nil {
 		done(err)
 		return err
@@ -884,7 +884,7 @@ func (db *DB) writeRequests(reqs []*request) error { //批量处理写请求
 
 	db.opt.Debugf("Writing to memtable")
 	var count int
-	for _, b := range reqs { // 写入LSM中（核心代码块）
+	for _, b := range reqs { // NOTE:核心代码块，写入LSM中
 		if len(b.Entries) == 0 { // 当前req内没有kv对要写入就跳过
 			continue
 		}
@@ -959,7 +959,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 		if err := db.writeRequests(reqs); err != nil {
 			db.opt.Errorf("writeRequests: %v", err)
 		}
-		<-pendingCh // 将那一个缓冲区释放，表示当前这一个写请求已经完成了（箭头左边不放东西就是单纯释放掉了）
+		<-pendingCh // 将那一个标记在写的缓冲区释放，表示当前这一个写请求已经完成了（箭头左边不放东西就是单纯释放掉了）
 	}
 
 	// This variable tracks the number of pending writes.
@@ -981,22 +981,22 @@ func (db *DB) doWrites(lc *z.Closer) {
 			reqLen.Set(int64(len(reqs)))
 
 			if len(reqs) >= 3*kvWriteChCapacity { // 是否大于KV写缓存的容量长度（kvWriteChCapacity是常量固定1000）
-				pendingCh <- struct{}{} // blocking.
+				pendingCh <- struct{}{} // blocking.标记开始处理写
 				goto writeCase
 			}
 
 			select {
 			// Either push to pending, or continue to pick from writeCh.
-			// 要么推到待定，要么继续从writeCh中选择。
-			case r = <-db.writeCh: //继续读写请求
-			case pendingCh <- struct{}{}: //阻塞去处理写请求
+			// 要么开始处理，要么继续从writeCh中选择。
+			case r = <-db.writeCh: // 继续读写请求
+			case pendingCh <- struct{}{}: // 阻塞，读不出来更新的写请求了，开始处理写
 				goto writeCase
 			case <-lc.HasBeenClosed():
 				goto closedCase
 			}
 		}
 
-	closedCase: //这个貌似是在系统关闭的时候才会用到？
+	closedCase: //这个是在系统关闭的时候才会用到
 		// All the pending request are drained.
 		// Don't close the writeCh, because it has be used in several places.
 		// 所有待处理的请求都被清空。
@@ -1024,7 +1024,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 //
 //	Check(kv.BatchSet(entries))
 func (db *DB) batchSet(entries []*Entry) error {
-	req, err := db.sendToWriteCh(entries)
+	req, err := db.sendToWriteCh(entries) // NOTE:核心操作，这个sendToWriteCh函数与写请求的那个函数一样
 	if err != nil {
 		return err
 	}

@@ -154,7 +154,7 @@ func (lcs *levelCompactStatus) remove(dst keyRange) bool {
 type compactStatus struct {
 	sync.RWMutex
 	levels []*levelCompactStatus
-	tables map[uint64]struct{}
+	tables map[uint64]struct{} // 正在合并的tables
 }
 
 func (cs *compactStatus) overlapsWith(level int, this keyRange) bool {

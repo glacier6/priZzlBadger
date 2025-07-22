@@ -33,6 +33,7 @@ import (
 // memTable structure stores a skiplist and a corresponding WAL. Writes to memTable are written
 // both to the WAL and the skiplist. On a crash, the WAL is replayed to bring the skiplist back to
 // its pre-crash form.
+// memTable 结构存储了一个跳表（skiplist）和对应的预写日志（WAL）。写入 memTable 的数据会同时写入 WAL 和跳表。当发生崩溃时，WAL 会被重放（重新执行），以将跳表恢复到崩溃前的状态。
 type memTable struct {
 	// TODO: Give skiplist z.Calloc'd []byte.
 	// 对 memTable 的写入同时写入WAL和Skiplist。在崩溃时, 重播 WAL 以将Skiplist恢复到崩溃前的形式。

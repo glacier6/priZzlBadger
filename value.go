@@ -202,13 +202,13 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 		vp.Decode(vs.Value) // 当前value还是一个字节数组，需要进行编解码，序列化
 
 		// If the entry found from the LSM Tree points to a newer vlog file, don't do anything.
-		// 如果从LSM树中找到的条目指向较新的vlog文件，请不要做任何事情。
+		// 如果从LSM树中找到的条目指向较新的vlog文件，也请不要做任何事情（这样在之后就会删掉了）。
 		if vp.Fid > f.fid {
 			return nil
 		}
 		// If the entry found from the LSM Tree points to an offset greater than the one
 		// read from vlog, don't do anything.
-		// 如果从LSM树中找到的条目指向的偏移量大于从vlog中读取的偏移量，请不要做任何事情。
+		// 如果从LSM树中找到的条目指向的偏移量大于从vlog中读取的偏移量，请不要做任何事情（因为可能在当前选取的VLOG后面存在更新的版本，所以现在这个版本的也删掉）。
 		if vp.Offset > e.offset {
 			return nil
 		}
@@ -216,7 +216,7 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 		// insert them back into the DB.
 		// NOTE: It might be possible that the entry read from the LSM Tree points to
 		// an older vlog file. See the comments in the else part.
-		// 如果从LSM树和vlog文件读取的条目指向相同的vlog文件和偏移量，请将它们重新插入数据库。
+		// NOTE: 核心操作，如果从LSM树和vlog文件读取的条目指向相同的vlog文件和偏移量，请将它们重新插入数据库。
 		// 注意：从LSM树读取的条目可能指向较旧的vlog文件。请参阅其他部分的评论。
 		if vp.Fid == f.fid && vp.Offset == e.offset {
 			//vp（LSM树的）与e（Vlog的）都匹配的上，证明是一个有效的KV
@@ -242,7 +242,7 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 				if err := vlog.db.batchSet(wb); err != nil { //把判断有效的KV对重新写回LSM tree以及Vlog（批处理，基本与普通写入流程一致，即伪装成一次批量的写请求）
 					return err
 				}
-				size = 0
+				size = 0 // 本行与下一行清空缓冲区
 				wb = wb[:0]
 			}
 			wb = append(wb, ne) //缓冲区累计
@@ -1025,7 +1025,7 @@ func (vlog *valueLog) pickLog(discardRatio float64) *logFile {
 LOOP:
 	// Pick a candidate that contains the largest amount of discardable data
 	//discard是在磁盘中的一个文件，其会标记哪些KV是可以回收的，也记录 FID:该文件中垃圾KV对数量（每个关系就是一个16bit的slot）
-	fid, discard := vlog.discardStats.MaxDiscard() //得到包含最多可丢弃数据的vlog文件的fid，以及当前Vlog需要丢弃的KV对的总大小
+	fid, discard := vlog.discardStats.MaxDiscard() //得到包含最多可丢弃数据的vlog文件的fid，以及当前Vlog需要丢弃的KV对的总大小discard
 
 	// MaxDiscard will return fid=0 if it doesn't have any discard data. The
 	// vlog files start from 1.
@@ -1047,7 +1047,7 @@ LOOP:
 		vlog.opt.Errorf("Unable to get stats for value log fid: %d err: %+v", fi, err)
 		return nil
 	}
-	if thr := discardRatio * float64(fi.Size()); float64(discard) < thr { // 如果实际需要回收的键值对大小小于设定的阈值
+	if thr := discardRatio * float64(fi.Size()); float64(discard) < thr { // 如果实际需要回收的键值对大小 小于 设定的阈值
 		vlog.opt.Debugf("Discard: %d less than threshold: %.0f for file: %s",
 			discard, thr, fi.Name())
 		return nil
@@ -1115,7 +1115,7 @@ func (vlog *valueLog) runGC(discardRatio float64) error {
 			<-vlog.garbageCh
 		}()
 
-		lf := vlog.pickLog(discardRatio) // NOTE:核心操作，选择一个Vlog文件（这里得到的是Vlog文件的FID，并不是真的Vlog文件，所以全部是在内存操作的）
+		lf := vlog.pickLog(discardRatio) // NOTE:核心操作，选择一个需要GC的Vlog文件（这里得到的是Vlog文件的FID，并不是真的Vlog文件，所以全部是在内存操作的）
 		if lf == nil {
 			return ErrNoRewrite
 		}
