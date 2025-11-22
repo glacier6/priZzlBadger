@@ -102,7 +102,7 @@ type DB struct {
 	lc        *levelsController
 	vlog      valueLog
 	writeCh   chan *request
-	flushChan chan *memTable // For flushing memtables.
+	flushChan chan *memTable // For flushing memtables. // 用于刷新内存表。
 	closeOnce sync.Once      // For closing DB only once.
 
 	blockWrites atomic.Int32
@@ -177,6 +177,7 @@ func checkAndSetOptions(opt *Options) error {
 
 // 打开并返回一个DB对象 *DB（核心对象）
 func Open(opt Options) (*DB, error) {
+	// NOTE:2025111800
 	if err := checkAndSetOptions(&opt); err != nil {
 		return nil, err
 	}
@@ -191,7 +192,7 @@ func Open(opt Options) (*DB, error) {
 			return nil, err
 		}
 		var err error
-		if !opt.BypassLockGuard { // 这if里面是具体的去获得那两个锁
+		if !opt.BypassLockGuard { // 如果需要锁保护，则在if里去分别为 LSM树目录 及 VLog 加锁
 			dirLockGuard, err = acquireDirectoryLock(opt.Dir, lockFile, opt.ReadOnly)
 			if err != nil {
 				return nil, err
@@ -239,7 +240,7 @@ func Open(opt Options) (*DB, error) {
 		flushChan:     make(chan *memTable, opt.NumMemtables), //刷请请求的channel
 		writeCh:       make(chan *request, kvWriteChCapacity), //写请求的channel
 		opt:           opt,
-		manifest:      manifestFile,
+		manifest:      manifestFile,      //清单文件
 		dirLockGuard:  dirLockGuard,      //LSM目录锁
 		valueDirGuard: valueDirLockGuard, //VLog目录锁
 		orc:           newOracle(opt),    //KV引擎的并发事物的管理器，分配事务的版本号，Badger实现的是MVCC方式，然后通过Oracle来管理，维护了两个小顶堆，一个提交时间戳，一个读时间戳，只读的话只用后者，而UPDATE二者全用
@@ -247,7 +248,7 @@ func Open(opt Options) (*DB, error) {
 		pub:              newPublisher(),
 		allocPool:        z.NewAllocatorPool(8),
 		bannedNamespaces: &lockedKeys{keys: make(map[uint64]struct{})},
-		threshold:        initVlogThreshold(&opt),
+		threshold:        initVlogThreshold(&opt), // 初始化大小KV对的分界线等类似值
 	}
 
 	db.syncChan = opt.syncChan // 这个只用于测试
@@ -356,12 +357,12 @@ func Open(opt Options) (*DB, error) {
 		db.closers.memtable = z.NewCloser(1)
 		go func() {
 			db.flushMemtable(db.closers.memtable) // Need levels controller to be up. 需要levels controller已启动
-			// NOTE:核心操作，flushMemtable执行的是将memtable刷到磁盘L0层
+			// NOTE:核心操作，flushMemtable执行的是将immemtable刷到磁盘L0层
 			// 内有handleMemTableFlush是做将memtable中的数据刷入磁盘L0层操作的函数
 		}()
 		// Flush them to disk asap.
 		for _, mt := range db.imm { //刷新immemtable到磁盘
-			db.flushChan <- mt
+			db.flushChan <- mt // 处理在上面那个flushMemtable的函数里 NOTE:2025112100
 		}
 	}
 	// We do increment nextTxnTs below. So, no need to do it here.
@@ -585,7 +586,7 @@ func (db *DB) close() (err error) {
 					defer db.lock.Unlock()
 					y.AssertTrue(db.mt != nil)
 					select {
-					case db.flushChan <- db.mt:
+					case db.flushChan <- db.mt: // 处理在NOTE:2025112100
 						db.imm = append(db.imm, db.mt) // Flusher will attempt to remove this from s.imm.
 						db.mt = nil                    // Will segfault if we try writing!
 						db.opt.Debugf("pushed to flush chan\n")
@@ -865,6 +866,7 @@ func (db *DB) writeToLSM(b *request) error {
 
 // writeRequests is called serially by only one goroutine.
 func (db *DB) writeRequests(reqs []*request) error { //批量处理写请求
+	// NOTE:2025111806 写落盘开始
 	if len(reqs) == 0 {
 		return nil
 	}
@@ -891,7 +893,7 @@ func (db *DB) writeRequests(reqs []*request) error { //批量处理写请求
 		count += len(b.Entries) //累加待写入的kv对数量
 		var i uint64
 		var err error
-		// NOTE:核心操作，下面这个ensureRoomForWrite函数实际上就是做的判断memtable是否满足转换为immemtable的条件，并做一些操作
+		// NOTE:核心操作，下面这个ensureRoomForWrite函数实际上就是做的判断memtable是否满足转换为immemtable的条件，如果满足，就将其放到db.flushChan通道内，然后在 NOTE:2025112100 处写入磁盘
 		for err = db.ensureRoomForWrite(); err == errNoRoom; err = db.ensureRoomForWrite() {
 			i++
 			if i%100 == 0 {
@@ -929,8 +931,8 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	}
 	var count, size int64
 	for _, e := range entries {
-		size += e.estimateSizeAndSetThreshold(db.valueThreshold())
-		count++
+		size += e.estimateSizeAndSetThreshold(db.valueThreshold()) // 统计在LSM树结构中的总大小（即如果V超过阈值，只计算那个指针的大小）
+		count++                                                    // 统计KV对个数
 	}
 	y.NumBytesWrittenUserAdd(db.opt.MetricsEnabled, size)
 	if count >= db.opt.maxBatchCount || size >= db.opt.maxBatchSize {
@@ -1068,7 +1070,7 @@ func (db *DB) ensureRoomForWrite() error {
 	}
 
 	select {
-	case db.flushChan <- db.mt: // 将当前的memtable写入到flushChan通道中（这个通道内的都是待刷入磁盘的immemtable）
+	case db.flushChan <- db.mt: // 将当前的memtable写入到flushChan通道中（这个通道内的都是待刷入磁盘的immemtable） 处理在NOTE:2025112100
 		db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n",
 			db.mt.sl.MemSize(), len(db.flushChan))
 		// We manage to push this task. Let's modify imm.
@@ -1095,7 +1097,7 @@ func arenaSize(opt Options) int64 {
 func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *table.Builder {
 	defer iter.Close()
 
-	b := table.NewTableBuilder(bopts)
+	b := table.NewTableBuilder(bopts) // 构造器
 	for iter.Rewind(); iter.Valid(); iter.Next() {
 		if len(dropPrefixes) > 0 && hasAnyPrefixes(iter.Key(), dropPrefixes) {
 			continue
@@ -1105,7 +1107,7 @@ func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *
 		if vs.Meta&bitValuePointer > 0 {
 			vp.Decode(vs.Value)
 		}
-		b.Add(iter.Key(), iter.Value(), vp.Len)
+		b.Add(iter.Key(), iter.Value(), vp.Len) // 往SST构造器里面加入memtable的key
 	}
 
 	return b
@@ -1115,8 +1117,8 @@ func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *
 // handleMemTableFlush必须连续运行。handleMemTableFlush是做将memtable中的数据刷入磁盘L0层操作的函数
 func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
 	bopts := buildTableOptions(db)           //创建一个表配置
-	itr := mt.sl.NewUniIterator(false)       //创建一个迭代器
-	builder := buildL0Table(itr, nil, bopts) //buildL0Table从memtable构建一个新表的构造器。
+	itr := mt.sl.NewUniIterator(false)       //根据memtalbe内容创建一个迭代器
+	builder := buildL0Table(itr, nil, bopts) //NOTE:核心操作，buildL0Table以immemtable为基础的迭代器中构建一个新表的构造器（里面已经包含memtalbe的各个kv对）。
 	defer builder.Close()
 
 	// buildL0Table can return nil if the none of the items in the skiplist are
@@ -1128,20 +1130,20 @@ func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
 		return nil
 	}
 
-	fileID := db.lc.reserveFileID()
+	fileID := db.lc.reserveFileID() // 得到LSM树的文件ID,注意这个ID是Badger内部定义的ID，还没有创建ID对应的文件
 	var tbl *table.Table
 	var err error
 	if db.opt.InMemory {
 		data := builder.Finish()
 		tbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
 	} else {
-		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder) //从创建器中真正创建table
+		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder) //NOTE:从创建器中真正创建SST，table.NewFilename(fileID, db.opt.Dir)得到的是文件路径+文件名
 	}
 	if err != nil {
 		return y.Wrap(err, "error while creating table")
 	}
 	// We own a ref on tbl.
-	err = db.lc.addLevel0Table(tbl) // 将当前创建的表加载到levelcontroler的第0层
+	err = db.lc.addLevel0Table(tbl) // 将当前创建的表对象加到到levelcontroler的第0层以及更新清单文件（注意在上面那个CreateTable函数内就已经写入磁盘了，这里只是让levelcontroler得知新增的SST）
 	_ = tbl.DecrRef()               // Releases our ref.
 	return err
 }
@@ -1149,32 +1151,38 @@ func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
 // flushMemtable must keep running until we send it an empty memtable. If there
 // are errors during handling the memtable flush, we'll retry indefinitely.
 // flushMemtable必须继续运行，直到我们向它发送一个空的memtable。如果在处理memtable刷新过程中出现错误，我们将无限期重试。
+// db.flushChan这个通道内的都是待刷入磁盘的immemtable
+// NOTE:2025112100
 func (db *DB) flushMemtable(lc *z.Closer) {
 	defer lc.Done()
 
-	for mt := range db.flushChan {
+	for mt := range db.flushChan { // 取出来一个个immemtable，注意取完会阻塞，一直到再次接收到immemtable
 		if mt == nil {
 			continue
 		}
 
 		for {
-			if err := db.handleMemTableFlush(mt, nil); err != nil {
+			if err := db.handleMemTableFlush(mt, nil); err != nil { // NOTE:核心操作，将immemtable中的数据刷入磁盘L0层，并且更新清单文件和levercontroler
 				// Encountered error. Retry indefinitely.
+				// 遇到错误。无限期重试。
 				db.opt.Errorf("error flushing memtable to disk: %v, retrying", err)
 				time.Sleep(time.Second)
 				continue
 			}
 
 			// Update s.imm. Need a lock.
+			//更新s.imm。需要一把锁。
 			db.lock.Lock()
 			// This is a single-threaded operation. mt corresponds to the head of
 			// db.imm list. Once we flush it, we advance db.imm. The next mt
 			// which would arrive here would match db.imm[0], because we acquire a
 			// lock over DB when pushing to flushChan.
+			// 这是一个单线程操作。mt对应db.imm列表的头部。一旦我们冲洗它，我们就会前进db.imm。到达这里的下一个mt将与db.imm[0]匹配，因为我们在推送flushChan时获得了对db的锁定。
+
 			// TODO: This logic is dirty AF. Any change and this could easily break.
 			y.AssertTrue(mt == db.imm[0])
-			db.imm = db.imm[1:]
-			mt.DecrRef() // Return memory.
+			db.imm = db.imm[1:] // 与此同时，将imm的头去掉（这个头就对应刚刚刷如L0的Immemtalbe）
+			mt.DecrRef()        // Return memory.
 			// unlock
 			db.lock.Unlock()
 			break
@@ -1292,6 +1300,7 @@ func (db *DB) updateSize(lc *z.Closer) {
 // 一次只允许一个GC。如果另一个值日志GC正在运行，或者DB已关闭，这将返回ErrorRejected。
 // 注意：每次运行GC时，它都会在LSM树上产生一个活动尖峰。
 func (db *DB) RunValueLogGC(discardRatio float64) error {
+	// NOTE:2025111804 GC触发函数
 	if db.opt.InMemory { // 纯内存不需要GC
 		return ErrGCInMemoryMode
 	}

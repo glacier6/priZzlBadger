@@ -12,10 +12,11 @@ import (
 	"unsafe"
 )
 
+// kv对中v在Vlog中的指针
 type valuePointer struct {
 	Fid    uint32 // vlog文件的名字
 	Len    uint32 // value的长度
-	Offset uint32 // 在当前vlog的偏移量
+	Offset uint32 // 在Fid的vlog的偏移量
 }
 
 const vptrSize = unsafe.Sizeof(valuePointer{})
@@ -154,7 +155,7 @@ func (e *Entry) estimateSizeAndSetThreshold(threshold int64) int64 {
 	if v < e.valThreshold {
 		return k + v + 2 // Meta, UserMeta
 	}
-	return k + 12 + 2 // 12 for ValuePointer, 2 for metas.
+	return k + 12 + 2 // 12 for ValuePointer, 2 for metas. 即返回这个时，代表这个V超过阈值了，V的大小就固定为12（指向Vlog的指针）
 }
 
 func (e *Entry) skipVlogAndSetThreshold(threshold int64) bool {

@@ -76,7 +76,7 @@ type Iterator interface {
 	Next()
 	Rewind()
 	Seek(key []byte)
-	Key() []byte
+	Key() []byte // 这个key是带时间戳的key！
 	Value() ValueStruct
 	Valid() bool
 

@@ -464,6 +464,7 @@ type UniIterator struct {
 }
 
 // NewUniIterator returns a UniIterator.
+// 返回一个跳表的单元迭代器
 func (s *Skiplist) NewUniIterator(reversed bool) *UniIterator {
 	return &UniIterator{
 		iter:     s.NewIterator(),

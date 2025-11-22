@@ -117,7 +117,8 @@ func (s *levelHandler) replaceTables(toDel, toAdd []*table.Table) error {
 	for _, t := range toDel {
 		toDelMap[t.ID()] = struct{}{}
 	}
-	var newTables []*table.Table //创建一个容纳新SST的切片
+	var newTables []*table.Table //创建一个容纳目标层所有SST的切片
+	// 下面这个for是先将目标层未受影响的SST加入newTables
 	for _, t := range s.tables { //遍历目标层的原有SST，如果不在目标层受影响数组（cd.bot）内，就直接加到newTables，否则就跳过
 		_, found := toDelMap[t.ID()]
 		if !found { //如果不在cd.bot内
@@ -127,6 +128,7 @@ func (s *levelHandler) replaceTables(toDel, toAdd []*table.Table) error {
 		s.subtractSize(t) //如果在cd.bot内，那么就直接把该SST的大小减去
 	}
 
+	// 下面这个for是将目标层新生成的SST加入newTables
 	// Increase totalSize first.
 	for _, t := range toAdd { //遍历合并后的新的SST切片
 		s.addSize(t)
@@ -287,7 +289,7 @@ func (s *levelHandler) get(key []byte) (y.ValueStruct, error) {
 			continue
 		}
 		// 下面是查询	SST，即上面判断出阳性了
-		it := th.NewIterator(0) //创建一个迭代器
+		it := th.NewIterator(0) //创建一个SST迭代器
 		defer it.Close()
 
 		y.NumLSMGetsAdd(s.db.opt.MetricsEnabled, s.strLevel, 1) //统计信息

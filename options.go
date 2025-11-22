@@ -65,7 +65,7 @@ type Options struct {
 	// Changing BlockSize across DB runs will not break badger. The block size is
 	// read from the block index stored at the end of the table.
 	// 在数据库运行中更改BlockSize不会破坏badger。块大小从存储在表末尾的块索引中读取。
-	BlockSize          int
+	BlockSize          int // 块缓存大小
 	BloomFalsePositive float64
 	BlockCacheSize     int64
 	IndexCacheSize     int64
@@ -73,7 +73,7 @@ type Options struct {
 	NumLevelZeroTables      int
 	NumLevelZeroTablesStall int
 
-	ValueLogFileSize   int64
+	ValueLogFileSize   int64 // Vlog文件大小
 	ValueLogMaxEntries uint32
 
 	NumCompactors        int
@@ -91,6 +91,7 @@ type Options struct {
 	// BypassLockGuard will bypass the lock guard on badger. Bypassing lock
 	// guard can cause data corruption if multiple badger instances are using
 	// the same directory. Use this options with caution.
+	// BypassLockGuard 选项将绕过 Badger 的锁保护机制。若多个 Badger 实例共用同一目录，绕过锁保护可能导致数据损坏。使用此选项需谨慎。
 	BypassLockGuard bool
 
 	// ChecksumVerificationMode decides when db should verify checksums for SSTable blocks.

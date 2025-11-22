@@ -85,7 +85,7 @@ type TableInterface interface {
 }
 
 // Table represents a loaded table file with the info we have about it.
-// Table 表示一个加载的表文件, 其中包含我们所拥有的信息。smallest, biggest 可以在前缀查询时起到过滤作用。
+// Table 表示一个加载的SST表文件, 其中包含我们所拥有的信息。smallest, biggest 可以在前缀查询时起到过滤作用。
 type Table struct {
 	sync.Mutex
 	*z.MmapFile
@@ -250,9 +250,13 @@ func (b *Block) verifyCheckSum() error {
 	return y.VerifyChecksum(b.data, cs)
 }
 
+// 合并新建的SST还有immemtable刷盘的SST都是用的这个函数来写入磁盘
 func CreateTable(fname string, builder *Builder) (*Table, error) {
 	bd := builder.Done()
-	mf, err := z.OpenMmapFile(fname, os.O_CREATE|os.O_RDWR|os.O_EXCL, bd.Size)
+	mf, err := z.OpenMmapFile(fname, os.O_CREATE|os.O_RDWR|os.O_EXCL, bd.Size) // 创建并内存映射 SSTable 文件
+	// os.O_CREATE：若文件不存在则创建；
+	// os.O_RDWR：以 “可读可写” 模式打开（后续需写入数据，也需准备后续读取）；
+	// os.O_EXCL：与O_CREATE配合使用 —— 若文件已存在，则直接返回错误（避免覆盖已有 SSTable，防止数据丢失）；
 	if err == z.NewFile {
 		// Expected.
 	} else if err != nil {
@@ -261,12 +265,12 @@ func CreateTable(fname string, builder *Builder) (*Table, error) {
 		return nil, errors.Errorf("file already exists: %s", fname)
 	}
 
-	written := bd.Copy(mf.Data)
-	y.AssertTrue(written == len(mf.Data))
-	if err := z.Msync(mf.Data); err != nil {
+	written := bd.Copy(mf.Data)              // 将包含kv对的构建器中的数据拷贝到内存映射的文件区域
+	y.AssertTrue(written == len(mf.Data))    // 断言：确保写入的字节数 = 映射区域大小（数据无丢失/截断）
+	if err := z.Msync(mf.Data); err != nil { // 调用msync将映射区域的数据刷到磁盘（确保持久化）
 		return nil, y.Wrapf(err, "while calling msync on %s", fname)
 	}
-	return OpenTable(mf, *builder.opts)
+	return OpenTable(mf, *builder.opts) // 打开 SSTable 并返回可操作句柄
 }
 
 // OpenTable assumes file has only one table and opens it. Takes ownership of fd upon function

@@ -94,6 +94,7 @@ func (itr *blockIterator) setIdx(i int) {
 	// Header contains the length of key overlap and difference compared to the base key. If the key
 	// before this one had the same or better key overlap, we can avoid copying that part into
 	// itr.key. But, if the overlap was lesser, we could copy over just that portion.
+	// 标头包含键重叠的长度和与基本键的差异。如果此键之前的键有相同或更好的键重叠，我们可以避免将该部分复制到itr.key中。但是，如果重叠较小，我们可以只复制这部分。
 	if h.overlap > itr.prevOverlap {
 		itr.key = append(itr.key[:itr.prevOverlap], itr.baseKey[itr.prevOverlap:h.overlap]...)
 	}
@@ -142,6 +143,7 @@ func (itr *blockIterator) seek(key []byte, whence int) {
 		itr.setIdx(idx)                         //设置当前遍历到的kv对（设置最终结果也是这个函数），方便之后的比较
 		return y.CompareKeys(itr.key, key) >= 0 //进行比较
 	})
+	// 找到下标了，将找到的kv对设置上
 	itr.setIdx(foundEntryIdx)
 }
 
@@ -267,7 +269,7 @@ func (itr *Iterator) seekFrom(key []byte, whence int) {
 
 	var ko fb.BlockOffset
 	//下面是个二分查找，注意一个itr迭代器对应一个SST，所以现在是在SST内二分查找
-	idx := sort.Search(itr.t.offsetsLength(), func(idx int) bool { //遍历块（SST的更低一级的存储单元），idx返回目标key在SST的offset位置
+	idx := sort.Search(itr.t.offsetsLength(), func(idx int) bool { //遍历块（SST的更低一级的存储单元），idx返回目标key在SST的offset位置(即块的下标)
 		// Offsets should never return false since we're iterating within the OffsetsLength.
 		y.AssertTrue(itr.t.offsets(&ko, idx))
 		return y.CompareKeys(ko.KeyBytes(), key) > 0 //这个就是比较key

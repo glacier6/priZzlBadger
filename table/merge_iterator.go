@@ -204,17 +204,17 @@ func NewMergeIterator(iters []y.Iterator, reverse bool) y.Iterator {
 	case 1:
 		return iters[0]
 	case 2:
-		mi := &MergeIterator{
+		mi := &MergeIterator{ // 创建的非叶节点
 			reverse: reverse,
 		}
-		mi.left.setIterator(iters[0])
-		mi.right.setIterator(iters[1])
+		mi.left.setIterator(iters[0])  // 加入左叶节点
+		mi.right.setIterator(iters[1]) // 加入右叶节点
 		// Assign left iterator randomly. This will be fixed when user calls rewind/seek.
 		mi.small = &mi.left
 		return mi
 	}
 	mid := len(iters) / 2
-	return NewMergeIterator(
+	return NewMergeIterator( //不断递归迭代器切片，每次从中间一分为二（以生成二叉树）
 		[]y.Iterator{
 			NewMergeIterator(iters[:mid], reverse),
 			NewMergeIterator(iters[mid:], reverse),

@@ -22,6 +22,7 @@ func OpenManaged(opts Options) (*DB, error) {
 // can be ignored by most users.
 func (db *DB) NewTransactionAt(readTs uint64, update bool) *Txn {
 	if !db.opt.managedTxns {
+		// 一般只有管理模式才可以用at创建事务
 		panic("Cannot use NewTransactionAt with managedDB=false. Use NewTransaction instead.")
 	}
 	txn := db.newTransaction(update, true) // NOTE:核心操作

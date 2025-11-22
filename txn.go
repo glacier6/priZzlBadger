@@ -30,7 +30,7 @@ type oracle struct {
 	// writeChLock lock 用于确保事务被写入
 	// writeChLock 确保事务以与其提交时间戳相同的顺序进入写入通道。
 	writeChLock sync.Mutex
-	nextTxnTs   uint64
+	nextTxnTs   uint64 // 这个貌似是readTs与commitTs共用的，只不过readTs只会取，而commitTs则会在取的同时向后推进
 
 	// Used to block NewTransaction, so all previous commits are visible to a new read.
 	// 用于阻止NewTransaction，因此所有以前的提交对新的读取都是可见的。
@@ -164,7 +164,7 @@ func (o *oracle) hasConflict(txn *Txn) bool {
 }
 
 func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
-	//下面这两行标记是原子操作
+	//下面这两行标记当前函数中对oracle对象的操作是原子操作
 	o.Lock()
 	defer o.Unlock()
 
@@ -179,7 +179,7 @@ func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
 
 		// This is the general case, when user doesn't specify the read and commit ts.
 		ts = o.nextTxnTs
-		o.nextTxnTs++
+		o.nextTxnTs++       // 这里会向后推进
 		o.txnMark.Begin(ts) //正式进入提交阶段，badger把整个事务分为读取阶段以及提交阶段
 
 	} else { // 如果是托管模式，直接赋值commitTS
@@ -337,7 +337,7 @@ func (txn *Txn) newPendingWritesIterator(reversed bool) *pendingWritesIterator {
 	}
 	// Number of pending writes per transaction shouldn't be too big in general.
 	// 一般来说，每个事务的待处理写入次数不应太大。
-	sort.Slice(entries, func(i, j int) bool { //排序
+	sort.Slice(entries, func(i, j int) bool { //排序，当reversed为true时，按key的降序排，否则升序
 		cmp := bytes.Compare(entries[i].Key, entries[j].Key)
 		if !reversed {
 			return cmp < 0
@@ -412,7 +412,7 @@ func (txn *Txn) modify(e *Entry) error {
 	if oldEntry, ok := txn.pendingWrites[string(e.Key)]; ok && oldEntry.version != e.version { //如果在托管模式下，若同一个key 写入了两次（但是版本号不一样），那么就把老版本的放到下面这个计算重复写入的数组里面
 		txn.duplicateWrites = append(txn.duplicateWrites, oldEntry) // 因为如果不放入的话，老版就会被覆盖清理掉
 	}
-	txn.pendingWrites[string(e.Key)] = e
+	txn.pendingWrites[string(e.Key)] = e // 加入当前事务待写入切片，之后会在Commit的时候写入 NOTE:2025111805
 	return nil
 	// 注意此时，还没有写到磁盘，还在内存
 }
@@ -689,6 +689,7 @@ func (txn *Txn) commitPrecheck() error {
 // 5.如果提供回调，Badger将在检查冲突后立即返回。写入数据库将在后台进行。如果发生冲突，将返回错误，回调将不会运行。如果没有冲突，则在成功完成写入或写入过程中出现任何错误时，将在后台调用回调。
 // 如果错误为零，则事务成功提交。如果出现非nil错误，LSM树将不会更新，因此不需要任何回滚。
 func (txn *Txn) Commit() error {
+	// NOTE:2025111805
 	// txn.conflictKeys can be zero if conflict detection is turned off. So we
 	// should check txn.pendingWrites.
 	if len(txn.pendingWrites) == 0 { //判断当前txn是否有写入操作发生过，为空直接返回
@@ -710,6 +711,7 @@ func (txn *Txn) Commit() error {
 
 	// TODO: What if some of the txns successfully make it to value log, but others fail.
 	// Nothing gets updated to LSM, until a restart happens.
+	// TODO：如果一些txns成功地进入值日志，但其他txns失败了怎么办。在重新启动之前，LSM不会更新任何内容。
 	return txnCb()
 }
 
@@ -808,7 +810,7 @@ func (db *DB) newTransaction(update, isManaged bool) *Txn {
 		update = false
 	}
 
-	txn := &Txn{
+	txn := &Txn{ //创建事务本体
 		update: update,
 		db:     db,
 		count:  1,                       // One extra entry for BitFin.
@@ -818,7 +820,7 @@ func (db *DB) newTransaction(update, isManaged bool) *Txn {
 		if db.opt.DetectConflicts {
 			txn.conflictKeys = make(map[uint64]struct{}) // 这个map对进行修改的key进行记录，使用map也是方便其他事务进行冲突检查
 		}
-		txn.pendingWrites = make(map[string]*Entry) //所有当前事务写入的操作在这里记录
+		txn.pendingWrites = make(map[string]*Entry) //所有当前事务写入的操作在这里记录，之后由初始化创建的写线程来处理
 	}
 	if !isManaged {
 		txn.readTs = db.orc.readTs() //NOTE:核心操作,为当前新增的事务授时，即记录开始时间戳，因为常用于读取数据，所以也叫读取时间戳（直接复制来自 oracle 对象的 nextTxnTs 字段中记录的当前时间戳即可。）
@@ -830,6 +832,7 @@ func (db *DB) newTransaction(update, isManaged bool) *Txn {
 // returned by the function is relayed by the View method.
 // If View is used with managed transactions, it would assume a read timestamp of MaxUint64.
 func (db *DB) View(fn func(txn *Txn) error) error { //处理只读事务，只读事务除了begin等少数操作，不会阻塞其他事务
+	// NOTE:2025111802 只读事务（注意遍历器也是到这）
 	if db.IsClosed() {
 		return ErrDBClosed
 	}
@@ -841,13 +844,14 @@ func (db *DB) View(fn func(txn *Txn) error) error { //处理只读事务，只�
 	}
 	defer txn.Discard()
 
-	return fn(txn)
+	return fn(txn) //只读事务无需提交
 }
 
 // Update executes a function, creating and managing a read-write transaction
 // for the user. Error returned by the function is relayed by the Update method.
 // Update cannot be used with managed transactions.
 func (db *DB) Update(fn func(txn *Txn) error) error {
+	// NOTE:2025111801 读写事务
 	if db.IsClosed() {
 		return ErrDBClosed
 	}

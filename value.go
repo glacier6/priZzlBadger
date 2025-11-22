@@ -39,7 +39,7 @@ const (
 	bitValuePointer           byte = 1 << 1 // Set if the value is NOT stored directly next to key.
 	bitDiscardEarlierVersions byte = 1 << 2 // Set if earlier versions can be discarded.
 	// Set if item shouldn't be discarded via compactions (used by merge operator)
-	bitMergeEntry byte = 1 << 3
+	bitMergeEntry byte = 1 << 3 // 设置项目是否不应通过压缩丢弃（用于合并操作符）
 	// The MSB 2 bits are for transactions.
 	bitTxn    byte = 1 << 6 // Set if the entry is part of a txn. 用于判别该条目是否为txn的一部分。
 	bitFinTxn byte = 1 << 7 // Set if the entry is to indicate end of txn in value log. 用于判别该条目是否指示vlog中txn的结束。
@@ -798,7 +798,7 @@ func estimateRequestSize(req *request) uint64 {
 }
 
 // write is thread-unsafe by design and should not be called concurrently.
-func (vlog *valueLog) write(reqs []*request) error { //这里面将数据写入磁盘的vlog中（记住是通过mmap方式写入的）
+func (vlog *valueLog) write(reqs []*request) error { //这里面将大KV对的V写入磁盘的vlog中（记住是通过mmap方式写入的）
 	if vlog.db.opt.InMemory {
 		return nil
 	}
@@ -867,7 +867,7 @@ func (vlog *valueLog) write(reqs []*request) error { //这里面将数据写入�
 	//开始真正遍历reqs，每个req里面有一个Entries数组
 	for i := range reqs {
 		b := reqs[i]
-		b.Ptrs = b.Ptrs[:0] // 这个数组用来记录处理后的kv对，包含kv分离的以及不分离的，不分离的valuePointer对象为空
+		b.Ptrs = b.Ptrs[:0] // 这个数组用来记录处理后的kv对，包含kv分离的以及不分离的，不分离的valuePointer对象为空，注意b.ptrs的顺序与b.Entries的顺序一一对应
 		var written, bytesWritten int
 		valueSizes := make([]int64, 0, len(b.Entries))
 		// 遍历当前请求的kv对数组，挨个执行写入且进行统计
@@ -878,10 +878,10 @@ func (vlog *valueLog) write(reqs []*request) error { //这里面将数据写入�
 			valueSizes = append(valueSizes, int64(len(e.Value)))     //得到当前单个kv对的v大小
 			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) { // 是否跳过vlog，为true就是kv全放LSM树
 				// valueThreshold就是分大小kv的那个阈值，注意，每个kv对象Entry内都会存一个，所以就算之后改变这个阈值，老系统也能正常运转
-				b.Ptrs = append(b.Ptrs, valuePointer{}) // 现在加在这里面的应该就是不用kv分离的
+				b.Ptrs = append(b.Ptrs, valuePointer{}) // 现在加在这里面的就是不用kv分离的，因为没有在Vlog中的数据，所以valuePointer为空
 				continue
 			}
-			var p valuePointer
+			var p valuePointer // 记录当前KV对在哪个Vlog文件及其Vlog文件的偏移量以及Value长度
 
 			p.Fid = curlf.fid
 			p.Offset = vlog.woffset() // 得到当前活跃vlog文件的偏移量
@@ -904,11 +904,11 @@ func (vlog *valueLog) write(reqs []*request) error { //这里面将数据写入�
 
 			p.Len = uint32(plen)               //记录当前kv对的长度
 			b.Ptrs = append(b.Ptrs, p)         //将当前放入vlog的kv对的信息记录起来
-			if err := write(buf); err != nil { // 真正开始将当前kv对转换的字节流执行写入
+			if err := write(buf); err != nil { // NOTE:核心操作，真正开始将当前kv对转换的字节流执行写入
 				return err
 			}
 			written++                 //已写入的个数累计
-			bytesWritten += buf.Len() //已写入的字节流长度
+			bytesWritten += buf.Len() //已写入Vlog的字节流长度
 			// No need to flush anything, we write to file directly via mmap.
 			// 无需刷新任何内容，我们直接通过mmap写入文件。
 		}
@@ -919,7 +919,9 @@ func (vlog *valueLog) write(reqs []*request) error { //这里面将数据写入�
 		vlog.db.threshold.update(valueSizes)
 		// We write to disk here so that all entries that are part of the same transaction are
 		// written to the same vlog file.
-		if err := toDisk(); err != nil {
+		// 我们在此将数据写入磁盘，以便同一事务中的所有条目都能
+		// 写入同一份vlog文件。
+		if err := toDisk(); err != nil { // 尝试落盘，即先判断Vlog文件是否满额，满额就去落盘
 			return err
 		}
 	}
@@ -1151,7 +1153,7 @@ type vlogThreshold struct {
 func initVlogThreshold(opt *Options) *vlogThreshold {
 	getBounds := func() []float64 {
 		mxbd := opt.maxValueThreshold
-		mnbd := float64(opt.ValueThreshold)
+		mnbd := float64(opt.ValueThreshold) // 这个是大小KV对的数据量分界线
 		y.AssertTruef(mxbd >= mnbd, "maximum threshold bound is less than the min threshold")
 		size := math.Min(mxbd-mnbd+1, 1024.0)
 		bdstp := (mxbd - mnbd) / size

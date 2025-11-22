@@ -29,13 +29,13 @@ const (
 // iterator.Next() is called.
 type Item struct {
 	key       []byte
-	vptr      []byte
-	val       []byte
+	vptr      []byte // 值指针（一开始读的时候，无论是否是kv分离的vlog指针还是kv不分离的普通值都会放在这里面）
+	val       []byte // 具体值
 	version   uint64
 	expiresAt uint64
 
 	slice *y.Slice // Used only during prefetching.
-	next  *Item
+	next  *Item    // item在综合迭代器中以普通单向链结构组合组装
 	txn   *Txn
 
 	err      error
@@ -154,7 +154,7 @@ func (item *Item) yieldItemValue() ([]byte, func(), error) {
 	}
 	// 是kv分离
 	var vp valuePointer
-	vp.Decode(item.vptr) //解码值指针
+	vp.Decode(item.vptr) //解码vlog值指针
 	db := item.txn.db
 	result, cb, err := db.vlog.Read(vp, item.slice) // NOTE:核心操作，去磁盘读目标value
 	if err != nil {
@@ -196,7 +196,7 @@ func runCallback(cb func()) {
 }
 
 func (item *Item) prefetchValue() {
-	val, cb, err := item.yieldItemValue() // NOTE:核心操作，获取item的value值
+	val, cb, err := item.yieldItemValue() // NOTE:核心操作，获取item的value值（无论kv是否分离）
 	defer runCallback(cb)
 
 	item.err = err
@@ -266,8 +266,8 @@ func (item *Item) ExpiresAt() uint64 {
 
 // TODO: Switch this to use linked list container in Go.
 type list struct {
-	head *Item
-	tail *Item
+	head *Item // 头
+	tail *Item // 尾部
 }
 
 func (l *list) push(i *Item) {
@@ -282,11 +282,11 @@ func (l *list) push(i *Item) {
 }
 
 func (l *list) pop() *Item {
-	if l.head == nil {
+	if l.head == nil { // 头部没有数据，就无数据
 		return nil
 	}
 	i := l.head
-	if l.head == l.tail {
+	if l.head == l.tail { // 这个if else让list的index向后走
 		l.tail = nil
 		l.head = nil
 	} else {
@@ -310,7 +310,10 @@ type IteratorOptions struct {
 	// iteration and store them.
 	//PrefetchValues指示我们是否应该在迭代期间预取值并存储它们。
 	PrefetchValues bool
-	Reverse        bool // Direction of iteration. False is forward, true is backward.
+
+	Reverse bool // Direction of iteration. False is forward, true is backward.
+	// 迭代方向。假是前进（即从小到大正向），真是后退（即从大到小）。 特别注意，在正向遍历中，同一个key的按commitTs的降序来排列，即这两个方向在存储上是相反的
+
 	AllVersions    bool // Fetch all valid versions of the same key.
 	InternalAccess bool // Used to allow internal access to badger keys.
 
@@ -318,7 +321,7 @@ type IteratorOptions struct {
 	// picks up. If Prefix is specified, only tables which could have this
 	// prefix are picked based on their range of keys.
 	prefixIsKey bool   // If set, use the prefix for bloom filter lookup.
-	Prefix      []byte // Only iterate over this given prefix.
+	Prefix      []byte // Only iterate over this given prefix. 只迭代这个给定的前缀。
 	SinceTs     uint64 // Only read data that has version > SinceTs.
 }
 
@@ -430,16 +433,16 @@ var DefaultIteratorOptions = IteratorOptions{
 
 // Iterator helps iterating over the KV pairs in a lexicographically sorted order.
 type Iterator struct {
-	iitr   y.Iterator
+	iitr   y.Iterator // 合并的迭代器（二叉树结构，包含当前事务的，内存的，外存的（按level展开））
 	txn    *Txn
 	readTs uint64
 
 	opt   IteratorOptions
 	item  *Item
-	data  list
+	data  list // 存放预读取的数据
 	waste list
 
-	lastKey []byte // Used to skip over multiple versions of the same key.
+	lastKey []byte // Used to skip over multiple versions of the same key. 用于跳过同一key的多个版本，记录的是上个key值。
 
 	closed  bool
 	scanned int // Used to estimate the size of data scanned by iterator. //用于估计迭代器扫描的数据大小。
@@ -467,6 +470,7 @@ type Iterator struct {
 // 并与 MemTableIterator、TableIterator 等 Iterator 通过 MergeIterator 组合为最终的 Iterator
 // badger 会将 commitTs 作为 key 的后缀存储到 LSM Tree 中，Iterator 在迭代中也会对时间戳有感知，按 readTs 时刻的快照数据进行迭代。
 func (txn *Txn) NewIterator(opt IteratorOptions) *Iterator {
+	// NOTE:2025111803 迭代器的初始化
 	if txn.discarded {
 		panic(ErrDiscardedTxn)
 	}
@@ -483,7 +487,7 @@ func (txn *Txn) NewIterator(opt IteratorOptions) *Iterator {
 	tables, decr := txn.db.getMemTables() // NOTE:核心操作，返回memtable与immemtable的合集
 	defer decr()
 	txn.db.vlog.incrIteratorCount()                                   // 内存numActiveIterators，这个数字一旦为0，就可以删除当前vLog对象（就本行的那个vlog）内的ToBeDeleted文件。
-	var iters []y.Iterator                                            //创建迭代器数组
+	var iters []y.Iterator                                            // 创建迭代器数组（包含当前事务的，内存的，外存的（按level展开））
 	if itr := txn.newPendingWritesIterator(opt.Reverse); itr != nil { //NOTE:核心操作，先创建 用于遍历存储当前事务待写入数据的数组的 迭代器
 		iters = append(iters, itr)
 	}
@@ -494,7 +498,7 @@ func (txn *Txn) NewIterator(opt IteratorOptions) *Iterator {
 	iters = txn.db.lc.appendIterators(iters, &opt) // This will increment references. NOTE:核心操作
 	res := &Iterator{                              // NOTE:471
 		txn:    txn,
-		iitr:   table.NewMergeIterator(iters, opt.Reverse), // NOTE:核心操作，合并的迭代器（二叉树结构），包含事物的，内存的，外存的（按level展开）
+		iitr:   table.NewMergeIterator(iters, opt.Reverse), // NOTE:核心操作，以平衡二叉树为结构组织iters切片（叶子节点就是一个个数据表，且叶子节点从左至右对应数据表的从新到旧（因为前面数据表的加入顺序））
 		opt:    opt,
 		readTs: txn.readTs,
 	}
@@ -647,7 +651,7 @@ func (it *Iterator) parseItem() bool {
 	}
 
 	// Skip any versions which are beyond the readTs.
-	version := y.ParseTs(key)
+	version := y.ParseTs(key) // 解析出来版本号
 	// Ignore everything that is above the readTs and below or at the sinceTs.
 	if version > it.readTs || (it.opt.SinceTs > 0 && version <= it.opt.SinceTs) { //如果目标key的版本号（时间戳）大于当前查询事务的版本号，说明这是在此迭代器开始之后写入的key不能被读取
 		mi.Next()
@@ -674,11 +678,10 @@ func (it *Iterator) parseItem() bool {
 
 	// If iterating in forward direction, then just checking the last key against current key would
 	// be sufficient.
-	// 如果向前迭代，那么只需将最后一个键与当前键进行比较就足够了。
-	// PS：应该是只要取出来第一个key就可以了，因为这个是最新的
-	if !it.opt.Reverse {
-		if y.SameKey(it.lastKey, key) { //若是老版本的已经取出来的key，就排除（在前面的轮询中已经读出来新版的key了)
-			mi.Next()
+	// 如果向前迭代（从小到大），那么只需将最后一个键与当前键进行比较就足够了。
+	if !it.opt.Reverse { // 如果是正向的遍历（从小到大）
+		if y.SameKey(it.lastKey, key) { // 在正向遍历中，同一个key的按commitTs的降序来排列
+			mi.Next() // 下移
 			return false
 		}
 		// Only track in forward direction.
@@ -697,6 +700,7 @@ func (it *Iterator) parseItem() bool {
 
 FILL:
 	// If deleted, advance and return.
+	// 如果删除，请前进并返回。
 	vs := mi.Value()
 	if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) { //解析value的值，并从中判断是否过期与删除
 		mi.Next()
@@ -709,7 +713,7 @@ FILL:
 	// means no Next was called.
 	// 根据当前光标位置填充项目。所有Next调用都已返回，因此到达此处意味着没有调用Next。
 
-	mi.Next()                           //判断下一个                           // Advance but no fill item yet.
+	mi.Next()                           //判断下一个 // Advance but no fill item yet.
 	if !it.opt.Reverse || !mi.Valid() { // Forward direction, or invalid.
 		setItem(item)
 		return true
@@ -742,8 +746,8 @@ func (it *Iterator) fill(item *Item) {
 		item.wg.Add(1) //这里是go语言的并发控制的一个组件
 		go func() {    // 创建一个协程异步的读取vlog文件
 			// FIXME we are not handling errors here.
-			item.prefetchValue() //从vlog里面去拿
-			item.wg.Done()       //这里就是前面有个wg.wait的地方 NOTE:0 处
+			item.prefetchValue() // 获取value（kv分离还是kv不分离的都在这里面得到）
+			item.wg.Done()       // 这里就是前面有个wg.wait的地方 NOTE:0 处
 		}()
 	}
 }
@@ -789,7 +793,7 @@ func (it *Iterator) Seek(key []byte) {
 	if len(key) > 0 { //非初始化，就是读
 		it.txn.addReadKey(key)
 	}
-	for i := it.data.pop(); i != nil; i = it.data.pop() { // it.data是一个链表，存的是预读取的数据
+	for i := it.data.pop(); i != nil; i = it.data.pop() { // it.data是一个链表，存的是预读取的数据（这里这个操作貌似是把所有预读取的数据移动到waste？）
 		i.wg.Wait() //做一个小范围的异步，等待vlog中的值读到内存 NOTE:0
 		it.waste.push(i)
 	}
@@ -799,7 +803,7 @@ func (it *Iterator) Seek(key []byte) {
 		key = it.opt.Prefix
 	}
 	if len(key) == 0 {
-		it.iitr.Rewind() //调整迭代器的平衡二叉树，保证range key是从小到大的顺序读取的
+		it.iitr.Rewind() //调整迭代器的平衡二叉树，保证range key是从小到大的顺序读取的（当reversed为默认的false时）
 		it.prefetch()    //NOTE:核心操作，预取操作，真的要读了
 		return
 	}
