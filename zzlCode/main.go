@@ -22,15 +22,16 @@ func main() {
 
 	// 2.读写事务
 	// 在读写事务中允许所有数据库操作。
-	// err = db.Update(func(txn *badger.Txn) error {
-	// 	txn.Set([]byte("answer"), []byte("42"))
-	// 	txn.Get([]byte("answer"))
+	err = db.Update(func(txn *badger.Txn) error {
+		txn.Set([]byte("answer"), []byte("42")) // 注意如果是修改的话，旧版本的KV对在压缩的时候才会删掉（当然如果kv分离的话，在GC的时候，v就会被删掉了）
+		txn.Get([]byte("answer"))
+		txn.Delete([]byte("answer")) // 注意删除就是新增了一个带有删除标记的kv对（v为空），而旧版在LSM的数据在压缩的时候才会删除
 
-	// 	// 或者下面这种set方式
-	// 	e := badger.NewEntry([]byte("answer2"), []byte("55"))
-	// 	err := txn.SetEntry(e)
-	// 	return err
-	// })
+		// 或者下面这种set方式
+		e := badger.NewEntry([]byte("answer2"), []byte("55"))
+		err := txn.SetEntry(e)
+		return err
+	})
 	// 3.只读事务
 	// 您不能在此事务中执行任何写入或删除。Badger 确保您在此闭包中获得一致的数据库视图。事务开始后在其他地方发生的任何写入, 都不会被闭包内的调用看到。
 	err = db.View(func(txn *badger.Txn) error {

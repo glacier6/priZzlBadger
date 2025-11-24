@@ -74,6 +74,7 @@ func (txn *Txn) CommitAt(commitTs uint64, callback func(error)) error {
 // SetDiscardTs sets a timestamp at or below which, any invalid or deleted
 // versions can be discarded from the LSM tree, and thence from the value log to
 // reclaim disk space. Can only be used with managed transactions.
+// ``` SetDiscardTs 设置一个时间戳，低于该时间戳的任何无效或已删除版本可以从LSM树中移除，进而从值日志中删除以回收磁盘空间。仅限于管理型事务使用。```。
 func (db *DB) SetDiscardTs(ts uint64) {
 	if !db.opt.managedTxns {
 		panic("Cannot use SetDiscardTs with managedDB=false.")

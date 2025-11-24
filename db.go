@@ -958,7 +958,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 	pendingCh := make(chan struct{}, 1) // 一个缓冲区的chan，里面不放具体数据，只是用来阻塞用的
 
 	writeRequests := func(reqs []*request) {
-		if err := db.writeRequests(reqs); err != nil {
+		if err := db.writeRequests(reqs); err != nil { // NOTE:核心操作，写入数据
 			db.opt.Errorf("writeRequests: %v", err)
 		}
 		<-pendingCh // 将那一个标记在写的缓冲区释放，表示当前这一个写请求已经完成了（箭头左边不放东西就是单纯释放掉了）

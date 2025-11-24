@@ -37,9 +37,8 @@ type oracle struct {
 	txnMark *y.WaterMark
 
 	// Either of these is used to determine which versions can be permanently
-	// 其中任何一个都用于确定哪些版本可以永久保存
 	// discarded during compaction.
-	// 在compaction过程中丢弃。
+	// 其中任何一个都用于确定在压缩过程中可以永久丢弃哪些版本。（注意，仅仅用于管理模型，由上层赋予（如DGraph））
 	discardTs uint64       // Used by ManagedDB.
 	readMark  *y.WaterMark // Used by DB.
 
@@ -443,6 +442,10 @@ func (txn *Txn) SetEntry(e *Entry) error {
 //
 // The current transaction keeps a reference to the key byte slice argument.
 // Users must not modify the key until the end of the transaction.
+// Delete会删除一个键。
+// 这是通过在提交时间戳为密钥添加删除标记来实现的。在此时间戳之前发生的任何读取都不会受到影响。此提交后的任何读取都将看到删除。
+// 当前事务保留对键字节切片参数的引用。
+// 在交易结束之前，用户不得修改密钥。
 func (txn *Txn) Delete(key []byte) error {
 	e := &Entry{
 		Key:  key,

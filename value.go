@@ -34,10 +34,11 @@ var maxVlogFileSize uint32 = math.MaxUint32
 
 // Values have their first byte being byteData or byteDelete. This helps us distinguish between
 // a key that has never been seen and a key that has been explicitly deleted.
+// 值的第一个字节是byteData或byteDelete。这有助于我们区分从未见过的密钥和已被明确删除的密钥。
 const (
-	bitDelete                 byte = 1 << 0 // Set if the key has been deleted.
-	bitValuePointer           byte = 1 << 1 // Set if the value is NOT stored directly next to key.
-	bitDiscardEarlierVersions byte = 1 << 2 // Set if earlier versions can be discarded.
+	bitDelete                 byte = 1 << 0 // Set if the key has been deleted. 设置密钥是否已删除。
+	bitValuePointer           byte = 1 << 1 // Set if the value is NOT stored directly next to key. 如果该值没有直接存储在键旁边，则进行设置。
+	bitDiscardEarlierVersions byte = 1 << 2 // Set if earlier versions can be discarded. 设置是否可以丢弃早期版本。
 	// Set if item shouldn't be discarded via compactions (used by merge operator)
 	bitMergeEntry byte = 1 << 3 // 设置项目是否不应通过压缩丢弃（用于合并操作符）
 	// The MSB 2 bits are for transactions.

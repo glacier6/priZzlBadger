@@ -10,9 +10,9 @@
   NOTE:2025111806 写落盘具体执行处
   
   
+  zzlTODO:看看DGraph与BadgerDB的管理模式是如何交互的？
   
-  
-  zzlTODO:看一下discardTs是什么，怎么用的，NOTE:2025112200
+  看一下discardTs是什么，怎么用的？NOTE:2025112200 是BadgerDB在管理模式下才会用到的（如DGraph等上层管理事务时间戳时才会用）  
   看看有个压缩再解码的那个是在DGraph还是Badger的哪里？在Dgraph解码UID时用的
   某个kv的版本号怎么看？用item.version（）！
   DGraph数据库的管理模式下，版本号是怎么存的？在key后直接拼接commitTs！
@@ -144,6 +144,11 @@
   详见https://blog.csdn.net/weixin_64132124/article/details/143465619
   PS:进入项目的根目录，然后执行make指令即可打包，会把badger与Dgraph各自的二进制执行程序打包到各自项目目录的同名文件夹下。注意使用make命令之前需要执行makefile文件内的dependence的下载命令  
 
+### (11)Titan的GC
+  分为三块
+  - 1.Regular GC（普通垃圾回收）：这个与 BadgerDB 类似，用统计信息确定要回收的 BlobFile。它会检查 LSM 树中是否存在每个 blob 对应的指针，并生成一个新的只包含有效 blob 的 BlobFile，同时将键及其新位置写回到 LSM-Tree 中，最后移除旧的 BlobFile。这个过程不是直接对单个无效 blob 进行回收，而是以 BlobFile 为单位进行处理，可以看作是一种批量处理的方式。
+  - 2.Level Merge GC：这个就是在压缩的时候，也会将对应的BlobFile文件重写，并顺便更新SST中的vptr（注意这个仅仅在LSM树的最后两层启用）
+  - 3.打孔（Punch Hole）GC：当 Blob 文件中的无效 blob 大小超过阈值时，Titan 会使用带有 FALLOC_FL_PUNCH_HOLE 标志的 fallocate 来释放这些无效 blob 的空间，而不是重写整个 Blob 文件。（注意这个貌似会引发空间碎片，但是Titan有处理，可能是将下个加入的大KV放到打孔处？）
 
 # BadgerDB
 

@@ -147,14 +147,15 @@ func (t *Table) CompressionType() options.CompressionType {
 }
 
 // IncrRef increments the refcount (having to do with whether the file should be deleted)
-// IncrEf递增引用计数（与是否应删除文件有关）
+// IncrEf递增引用计数（与是否应删除文件有关），创建（或者有事务使用）的时候会加1
 func (t *Table) IncrRef() {
 	t.ref.Add(1)
 }
 
 // DecrRef decrements the refcount and possibly deletes the table
 // DecrEf递减引用计数，并可能删除表
-// zzlTODO:这里针对的是内存中的吗，压缩结束的时候也会对所有新生成的表执行一次这个，还有合并后的初始计数是多少？
+// NOTE:注意这里针对的是SST这个文件，每个SST有一个ref值，初始创建的时候是1,每有一个东西在用这个SST，ref就会+1,用完会再-1.
+// 而且压缩结束的时候也会对所有旧表执行一次这个，而新表则会执行IncrRef来初始为1
 func (t *Table) DecrRef() error {
 	newRef := t.ref.Add(-1) //引用计数减1
 	if newRef == 0 {        //如果计数为0了，那么说明已经没有人要用到这个SST了，那么就把这个SST给删除掉

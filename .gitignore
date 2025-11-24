@@ -3,3 +3,8 @@ badger-test*/
 .idea/
 
 vendor
+zzlCode/*.sst
+zzlCode/*.vlog
+zzlCode/DISCARD
+zzlCode/KEYREGISTRY
+zzlCode/MANIFEST

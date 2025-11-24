@@ -14,7 +14,7 @@ import (
 // Meta field.
 // ValueStruct表示可以与键关联的值信息，也表示内部Meta字段。
 type ValueStruct struct {
-	Meta      byte
+	Meta      byte // 元数据，里面有墓碑标记
 	UserMeta  byte
 	ExpiresAt uint64
 	Value     []byte
