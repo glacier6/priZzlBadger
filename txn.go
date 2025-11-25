@@ -430,6 +430,10 @@ func (txn *Txn) Set(key, val []byte) error {
 //
 // The current transaction keeps a reference to the entry passed in argument.
 // Users must not modify the entry until the end of the transaction.
+// SetEntry 接收一个 Entry 结构体，并将该结构体中的键值对，以及其他元数据一同添加到数据库中。
+// 当前事务会持有对传入参数中 Entry 结构体的引用。
+// 在事务结束前，用户不得修改该 Entry 结构体。
+// NOTE:2025112502 DGraph事务新增KV。
 func (txn *Txn) SetEntry(e *Entry) error {
 	return txn.modify(e)
 }

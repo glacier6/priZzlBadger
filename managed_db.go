@@ -10,8 +10,11 @@ package badger
 //
 // This is only useful for databases built on top of Badger (like Dgraph), and
 // can be ignored by most users.
+// OpenManaged返回一个新的DB，它允许对设置事务时间戳进行更多控制，也称为托管模式。
+// 这仅适用于基于Badger构建的数据库（如Dgraph），大多数用户可以忽略它。
+// NOTE:2025112500
 func OpenManaged(opts Options) (*DB, error) {
-	opts.managedTxns = true
+	opts.managedTxns = true // 设置托管模式
 	return Open(opts)
 }
 
@@ -20,13 +23,16 @@ func OpenManaged(opts Options) (*DB, error) {
 //
 // This is only useful for databases built on top of Badger (like Dgraph), and
 // can be ignored by most users.
+// NewTransactionAt 遵循与 DB.NewTransaction () 相同的逻辑，但其使用的是传入的读取时间戳。
+// 该函数仅对基于 Badger 构建的数据库（如 Dgraph）有用，大多数用户可忽略此函数。
+// NOTE:2025112501 Dgraph中创建事务
 func (db *DB) NewTransactionAt(readTs uint64, update bool) *Txn {
 	if !db.opt.managedTxns {
-		// 一般只有管理模式才可以用at创建事务
+		// 一般只有托管模式才可以用at创建事务
 		panic("Cannot use NewTransactionAt with managedDB=false. Use NewTransaction instead.")
 	}
-	txn := db.newTransaction(update, true) // NOTE:核心操作
-	txn.readTs = readTs
+	txn := db.newTransaction(update, true) // NOTE:核心操作，先创建一个事务
+	txn.readTs = readTs                    // 然后直接赋予readTs
 	return txn
 }
 
@@ -59,6 +65,7 @@ func (db *DB) NewManagedWriteBatch() *WriteBatch {
 // CommitAt 提交事务，遵循与 Commit () 相同的逻辑，但使用给定的提交时间戳
 // 若未与托管事务配合使用，此操作将引发 panic
 // 此功能仅对基于 Badger 构建的数据库（如 Dgraph）有用，大多数用户可忽略此函数
+// NOTE:2025112503 Dgraph事务提交
 func (txn *Txn) CommitAt(commitTs uint64, callback func(error)) error {
 	if !txn.db.opt.managedTxns {
 		panic("Cannot use CommitAt with managedDB=false. Use Commit instead.")

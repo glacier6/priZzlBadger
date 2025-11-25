@@ -8,14 +8,17 @@
   NOTE:2025060500 日志合并 （待看）
   NOTE:2025112100 immemtable刷盘
   NOTE:2025111806 写落盘具体执行处
+
+  看看DGraph与BadgerDB的托管模式是如何交互的？
+  NOTE:2025112500 DGraph的alpha节点创建托管模式（管理模式）的BadgerDB对象所用的函数（实际就是通到上面那个NOTE:2025111800 DB初始化）
+  NOTE:2025112501 DGraph事务创建 
+  NOTE:2025112502 DGraph事务新增KV 
+  NOTE:2025112503 DGraph事务提交 
   
-  
-  zzlTODO:看看DGraph与BadgerDB的管理模式是如何交互的？
-  
-  看一下discardTs是什么，怎么用的？NOTE:2025112200 是BadgerDB在管理模式下才会用到的（如DGraph等上层管理事务时间戳时才会用）  
+  看一下discardTs是什么，怎么用的？NOTE:2025112200 是BadgerDB在托管模式下才会用到的（如DGraph等上层管理事务时间戳时才会用）  
   看看有个压缩再解码的那个是在DGraph还是Badger的哪里？在Dgraph解码UID时用的
   某个kv的版本号怎么看？用item.version（）！
-  DGraph数据库的管理模式下，版本号是怎么存的？在key后直接拼接commitTs！
+  DGraph数据库的托管模式下，版本号是怎么存的？在key后直接拼接commitTs！
 
 ### (2)BadgerDB的一些需要关注点
   - 1.SST分为元数据块，索引块，DATA块  
