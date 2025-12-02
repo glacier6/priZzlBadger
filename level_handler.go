@@ -281,7 +281,7 @@ func (s *levelHandler) get(key []byte) (y.ValueStruct, error) {
 	tables, decr := s.getTableForKey(key) //NOTE:核心操作，获取当前层的可能包含目标key的SST句柄，0层把所有SST返回，其余层用二分查找找到目标那一个返回就可以
 	keyNoTs := y.ParseKey(key)            //获取没有时间戳的KEY
 
-	hash := y.Hash(keyNoTs) // 把key映射到了一个hash函数中
+	hash := y.Hash(keyNoTs) // 把key映射到了一个hash函数中（方便布隆）
 	var maxVs y.ValueStruct
 	for _, th := range tables { //一个th代表一个SST
 		if th.DoesNotHave(hash) { //判断布隆过滤器是否命中（每个SST写入时都会在元数据区包含一个布隆过滤器的数值）

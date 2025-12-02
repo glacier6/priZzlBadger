@@ -662,6 +662,7 @@ func (t *Table) blockCacheKey(idx int) []byte {
 
 // indexKey returns the cache key for block offsets. blockOffsets
 // are stored in the index cache.
+// indexKey 返回块偏移量（blockOffsets）的缓存键（cache key）。块偏移量（blockOffsets）存储在索引缓存（index cache）中。
 func (t *Table) indexKey() uint64 {
 	return t.id
 }
