@@ -795,7 +795,7 @@ func (db *DB) get(key []byte) (y.ValueStruct, error) {
 
 	y.NumGetsAdd(db.opt.MetricsEnabled, 1)
 	for i := 0; i < len(tables); i++ { //从最新开始遍历table
-		vs := tables[i].sl.Get(key) // NOTE:核心操作，去当前table的跳表中得到目标key
+		vs := tables[i].sl.Get(key) // NOTE:核心操作，去当前table的跳表中得到目标key NOTE:2025121502
 		y.NumMemtableGetsAdd(db.opt.MetricsEnabled, 1)
 		if vs.Meta == 0 && vs.Value == nil {
 			continue

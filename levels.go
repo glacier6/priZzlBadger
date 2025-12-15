@@ -67,6 +67,7 @@ func revertToManifest(kv *DB, mf *Manifest, idMap map[uint64]struct{}) error {
 }
 
 func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
+	// NOTE:2025121506
 	y.AssertTrue(db.opt.NumLevelZeroTablesStall > db.opt.NumLevelZeroTables) //断言
 	s := &levelsController{
 		kv:     db,
@@ -166,7 +167,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 		time.Since(start).Round(time.Millisecond))
 	s.nextFileID.Store(maxFileID + 1)
 	for i, tbls := range tables {
-		s.levels[i].initTables(tbls) //初始化LSM树的各层级的SST，主要是排序，0层按文件ID排序，更高层按KEY
+		s.levels[i].initTables(tbls) //NOTE:核心操作，初始化LSM树的各层级SST在内存中的元数据，主要是排序，0层按文件ID排序，更高层按KEY
 	}
 
 	// Make sure key ranges do not overlap etc.
@@ -406,7 +407,8 @@ func (s *levelsController) levelTargets() targets {
 		dbSize /= int64(s.kv.opt.LevelSizeMultiplier) // NOTE:得到下一层目标大小，每次折损10倍（badger默认层间比例为10）
 	}
 
-	// 下面这一块是计算文件大小（与上面那个倒立漏斗一样，文件大小也是倒立漏斗，漏斗拐角处就是基线层，但特别注意的是，0层是特殊的用MemTableSize，而其它基线层之前的则用的是baseLevel）
+	// NOTE:2025121500
+	// 下面这一块是计算.sst文件期望大小（与上面那个倒立漏斗一样，文件大小也是倒立漏斗，漏斗拐角处就是基线层，但特别注意的是，0层是特殊的用MemTableSize，而其它基线层之前的则用的是BaseTableSize）
 	tsz := s.kv.opt.BaseTableSize // BaseTableSize默认为2097152 即2 << 20
 	for i := 0; i < len(s.levels); i++ {
 		if i == 0 { //如果是0层，文件大小为配置里面的MemTableSize
@@ -1533,7 +1535,7 @@ func (s *levelsController) fillTables(cd *compactDef) bool {
 	// 按照MaxVersion的递增顺序对表进行排序，因此我们首先压缩旧表
 	s.sortByHeuristic(tables, cd)
 
-	// 从旧到新依次遍历高层的各个SST，找一个可以执行合并的高层sst
+	// 从旧到新依次遍历高层的各个SST，找一个可以执行合并的高层sst NOTE:2025121501
 	for _, t := range tables {
 		cd.thisSize = t.Size()
 		cd.thisRange = getKeyRange(t)
@@ -1799,7 +1801,7 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 			continue
 		}
 		//下面这一行是NOTE:核心操作，去当前遍历层找目标key
-		vs, err := h.get(key) // Calls h.RLock() and h.RUnlock().
+		vs, err := h.get(key) // Calls h.RLock() and h.RUnlock(). NOTE:2025121503
 		if err != nil {
 			return y.ValueStruct{}, y.Wrapf(err, "get key: %q", key)
 		}
