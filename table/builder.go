@@ -485,6 +485,7 @@ func (b *Builder) Opts() *Options {
 
 // encrypt will encrypt the given data and appends IV to the end of the encrypted data.
 // This should be only called only after checking shouldEncrypt method.
+// NOTE:2025121804
 func (b *Builder) encrypt(data []byte) ([]byte, error) {
 	iv, err := y.GenerateIV()
 	if err != nil {
@@ -493,7 +494,7 @@ func (b *Builder) encrypt(data []byte) ([]byte, error) {
 	needSz := len(data) + len(iv)
 	dst := b.alloc.Allocate(needSz)
 
-	if err = y.XORBlock(dst[:len(data)], data, b.DataKey().Data, iv); err != nil {
+	if err = y.XORBlock(dst[:len(data)], data, b.DataKey().Data, iv); err != nil { // NOTE:核心操作,调用加解密通用函数XORBlock
 		return data, y.Wrapf(err, "Error while encrypting in Builder.encrypt")
 	}
 

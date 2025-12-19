@@ -557,37 +557,44 @@ func (t *Table) block(idx int, useCache bool) (*Block, error) {
 	}
 	//没在块缓存中找到，下面是去mmap（磁盘）中获取
 	var ko fb.BlockOffset
-	y.AssertTrue(t.offsets(&ko, idx))       //这一步和下一步应该是要在这个新的块结构体内设置上该块在目标SST的一些信息然后存储在ko结构体中
-	blk := &Block{offset: int(ko.Offset())} //先在内存生成一个块结构体
+	y.AssertTrue(t.offsets(&ko, idx))       //获取第 idx 号块在文件中的 偏移量(Offset) 和 长度(Len)，这一步和下一步应该是要在这个新的块结构体内设置上该块在目标SST的一些信息然后存储在ko结构体中
+	blk := &Block{offset: int(ko.Offset())} //先在内存初始化生成一个块结构体
 	blk.ref.Store(1)                        //设置块的引用为1
 	defer blk.decrRef()                     // Deal with any errors, where blk would not be returned.
 	NumBlocks.Add(1)
 
 	var err error
-	if blk.data, err = t.read(blk.offset, int(ko.Len())); err != nil { //从磁盘的目标table中读出来block块
+	if blk.data, err = t.read(blk.offset, int(ko.Len())); err != nil { // NOTE:核心操作,返回MMAP文件的字节切片
+		// NOTE:注意实际上执行完此行,data里对应的数据实际还在外存!!直到你要访问data里面的数据时,才会发生缺页中断去访问对应页面(如下面的加解密)
+		// NOTE:注意访问却缺页中断也只会加载对应的那几页,这就会使内存空间的占用很小!!
 		return nil, y.Wrapf(err,
 			"failed to read from file: %s at offset: %d, len: %d",
 			t.Fd.Name(), blk.offset, ko.Len())
 	}
 
+	// NOTE:2025121803 Block的解密与解压(CPU密集型任务)
+	// 下面是解密的逻辑（加密为了安全）
 	if t.shouldDecrypt() {
 		// Decrypt the block if it is encrypted.
 		// 如果块已加密，则对其进行解密。
-		if blk.data, err = t.decrypt(blk.data, true); err != nil {
+		if blk.data, err = t.decrypt(blk.data, true); err != nil { // NOTE:核心操作，解密
 			return nil, err
 		}
 		// blk.data is allocated via Calloc. So, do free.
 		blk.freeMe = true
 	}
 
-	if err = t.decompress(blk); err != nil { //对块进行解压缩
+	// 下面是解压的逻辑（压缩为了省空间）
+	if err = t.decompress(blk); err != nil { //NOTE:核心操作,对块进行解压缩
 		return nil, y.Wrapf(err,
 			"failed to decode compressed data in file: %s at offset: %d, len: %d",
 			t.Fd.Name(), blk.offset, ko.Len())
 	}
 
+	// 注意下面,是从Block的尾部开始一段一段的读取(注意 4 的单位是字节)
+
 	// Read meta data related to block.
-	// 读取与块相关的元数据。
+	// NOTE:读取与块相关的元数据。确切地说是读取块尾部的校验和长度（4字节）
 	readPos := len(blk.data) - 4 // First read checksum length.
 	blk.chkLen = int(y.BytesToU32(blk.data[readPos : readPos+4]))
 
@@ -601,16 +608,18 @@ func (t *Table) block(idx int, useCache bool) (*Block, error) {
 
 	//下面这些都是解析块的元数据信息
 	// Read checksum and store it
-	// 读取校验和并存储
+	// NOTE:读取校验和并存储
 	readPos -= blk.chkLen
 	blk.checksum = blk.data[readPos : readPos+blk.chkLen]
+
 	// Move back and read numEntries in the block.
-	//向后移动并读取块中的numEntries。
+	// NOTE:继续向前移动并读取块中的numEntries（即有多个KV个数）。
 	readPos -= 4
 	numEntries := int(y.BytesToU32(blk.data[readPos : readPos+4]))
+
+	// NOTE:核心操作，解析 Entry Offsets,这些 Offsets 记录了 Block 内部每个 KV 对的起始位置(每个起始位置占用4个字节)，用于块内二分查找
 	entriesIndexStart := readPos - (numEntries * 4)
 	entriesIndexEnd := entriesIndexStart + numEntries*4
-
 	blk.entryOffsets = y.BytesToU32Slice(blk.data[entriesIndexStart:entriesIndexEnd])
 
 	blk.entriesIndexStart = entriesIndexStart
@@ -623,7 +632,7 @@ func (t *Table) block(idx int, useCache bool) (*Block, error) {
 
 	// Verify checksum on if checksum verification mode is OnRead on OnStartAndRead.
 	// 如果OnStartAndRead上的校验和验证模式为OnRead，请在上验证校验和。
-	if t.opt.ChkMode == options.OnBlockRead || t.opt.ChkMode == options.OnTableAndBlockRead {
+	if t.opt.ChkMode == options.OnBlockRead || t.opt.ChkMode == options.OnTableAndBlockRead { //校验
 		if err = blk.verifyCheckSum(); err != nil {
 			return nil, err
 		}
@@ -767,18 +776,23 @@ func (t *Table) KeyID() uint64 {
 
 // decrypt decrypts the given data. It should be called only after checking shouldDecrypt.
 func (t *Table) decrypt(data []byte, viaCalloc bool) ([]byte, error) {
-	// Last BlockSize bytes of the data is the IV.
-	iv := data[len(data)-aes.BlockSize:]
-	// Rest all bytes are data.
-	data = data[:len(data)-aes.BlockSize]
 
+	// 下面两行是分离 IV (初始化向量) 和 密文,在 AES 加密（通常是 CTR 模式）中，需要一个 Key（密钥）和一个 IV（初始化向量）。为了方便存储，业界通用的做法是将 IV 追加在密文的末尾。
+	// Last BlockSize bytes of the data is the IV.
+	iv := data[len(data)-aes.BlockSize:] // 取切片的最后 16 字节（aes.BlockSize 通常是 16）作为 iv。
+	// Rest all bytes are data.
+	data = data[:len(data)-aes.BlockSize] // 切片剩余的前半部分就是真正的密文数据。
+
+	// 下面这一块是分配“明文”内存 (Memory Allocation)
 	var dst []byte
 	if viaCalloc {
-		dst = z.Calloc(len(data), "Table.Decrypt")
+		dst = z.Calloc(len(data), "Table.Decrypt") // BadgerDB 封装的手动内存分配,目的是对于大块数据（SSTable 的 Block 通常较大），绕过 Go GC，减少 GC 压力
 	} else {
 		dst = make([]byte, len(data))
 	}
-	if err := y.XORBlock(dst, data, t.opt.DataKey.Data, iv); err != nil {
+
+	// 下面就正式开始解密了!!
+	if err := y.XORBlock(dst, data, t.opt.DataKey.Data, iv); err != nil { //NOTE:核心操作,解密,并将解密出来的数据放到dst上(使用了 AES 加密算法 配合 CTR (Counter) 模式。)
 		return nil, y.Wrapf(err, "while decrypt")
 	}
 	return dst, nil
@@ -820,29 +834,31 @@ func (t *Table) decompress(b *Block) error {
 	src := b.data
 
 	switch t.opt.Compression {
-	case options.None:
+	case options.None: // 如果没有开启压缩,就直接返回
 		// Nothing to be done here.
 		return nil
-	case options.Snappy:
-		if sz, err := snappy.DecodedLen(b.data); err == nil {
-			dst = z.Calloc(sz, "Table.Decompress")
+	case options.Snappy: // 如果是Snappy格式的压缩
+		// Snappy 格式通常在头部包含解压后的长度信息。snappy.DecodedLen 可以精确获取这个长度
+		if sz, err := snappy.DecodedLen(b.data); err == nil { // 获取解压后的数据大小
+			dst = z.Calloc(sz, "Table.Decompress") // 为解压缩后的数据分配空间
 		} else {
-			dst = z.Calloc(len(b.data)*4, "Table.Decompress") // Take a guess.
+			dst = z.Calloc(len(b.data)*4, "Table.Decompress") // Take a guess.// 猜一个大小
 		}
-		b.data, err = snappy.Decode(dst, b.data)
-		if err != nil {
+		b.data, err = snappy.Decode(dst, b.data) // NOTE:核心操作,解压缩snappy格式的数据
+		if err != nil {                          // 报错了就释放掉
 			z.Free(dst)
 			return y.Wrap(err, "failed to decompress")
 		}
-	case options.ZSTD:
-		sz := int(float64(t.opt.BlockSize) * 1.2)
+	case options.ZSTD: // 如果是ZSTD格式的压缩
+		sz := int(float64(t.opt.BlockSize) * 1.2) // 默认估算解压缩之后的大小是原始块大小的 1.2 倍
 		// Get frame content size from header.
-		var hdr zstd.Header
-		if err := hdr.Decode(b.data); err == nil && hdr.HasFCS && hdr.FrameContentSize < uint64(t.opt.BlockSize*2) {
+		// 尝试从 ZSTD Header 读取精确大小
+		var hdr zstd.Header                                                                                          // 创建一个ZSTD 的帧头对象
+		if err := hdr.Decode(b.data); err == nil && hdr.HasFCS && hdr.FrameContentSize < uint64(t.opt.BlockSize*2) { // 尝试解析出 ZSTD 的帧头,看是否包含 FrameContentSize (FCS)。如果包含且大小合理，就用精确大小。
 			sz = int(hdr.FrameContentSize)
 		}
-		dst = z.Calloc(sz, "Table.Decompress")
-		b.data, err = y.ZSTDDecompress(dst, b.data)
+		dst = z.Calloc(sz, "Table.Decompress")      // 分配空间
+		b.data, err = y.ZSTDDecompress(dst, b.data) // NOTE:核心操作,解压缩ZSTD格式的数据
 		if err != nil {
 			z.Free(dst)
 			return y.Wrap(err, "failed to decompress")
@@ -852,13 +868,17 @@ func (t *Table) decompress(b *Block) error {
 	}
 
 	if b.freeMe {
+		// 在调用 decompress 之前，b.data 可能已经经历过 decrypt（解密）。解密时可能分配了堆外内存并将 b.freeMe 设为 true。
+		// 现在我们要把 b.data 指向新的解压数据了，所以必须释放掉旧的 src 内存，否则会发生内存泄漏。
 		z.Free(src)
 		b.freeMe = false
 	}
 
 	if len(b.data) > 0 && len(dst) > 0 && &dst[0] != &b.data[0] {
+		// 异常情况,为了防止 dst 变成野指针导致泄漏，必须立刻手动 z.Free(dst) 把它释放掉。
 		z.Free(dst)
 	} else {
+		// 正常情况,解压函数（如 snappy.Decode）成功地将数据写入了我们分配的 dst。我们将 b.freeMe 设为 true。这意味着：“这个 Block 里的数据是手动分配的，将来 Block 销毁时，请务必调用 z.Free 来释放它。
 		b.freeMe = true
 	}
 	return nil

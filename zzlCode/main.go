@@ -52,7 +52,7 @@ func main() {
 		defer it.Close()
 		fmt.Printf("| %-*s | %s |\n", 40, "KEY", "VALUE")
 		fmt.Printf("|%s|%s|\n", strings.Repeat("-", 40+2), strings.Repeat("-", 20+2))
-
+		// it.Seek()
 		// NOTE:综合迭代器的item的版本号都是通过各个子迭代器的key()函数得到的
 		// PendingWrites子迭代器的版本直接就是当前事务readTs
 		// 其他的诸如memtable什么的SST就是直接是拼接存储时的key+commitTs

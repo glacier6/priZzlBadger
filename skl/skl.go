@@ -434,6 +434,7 @@ func (s *Iterator) Prev() {
 }
 
 // Seek advances to the first entry with a key >= target.
+// Seek 将（迭代器）移动到第一个 Key 大于或等于 target 的条目。
 func (s *Iterator) Seek(target []byte) {
 	s.n, _ = s.list.findNear(target, false, true) // find >=.
 }

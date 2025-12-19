@@ -73,12 +73,12 @@ func (v *ValueStruct) EncodeTo(buf *bytes.Buffer) {
 
 // Iterator is an interface for a basic iterator.
 type Iterator interface {
-	Next()
+	Next() // 决胜的叶子节点向后移动
 	Rewind()
-	Seek(key []byte)
-	Key() []byte // 这个key是带时间戳的key！
+	Seek(key []byte) // 重新定位锚点（index），会同时清空当前预读取的KV，并且非叶节点执行fix来进行比拼
+	Key() []byte     // 这个key是带时间戳的key！
 	Value() ValueStruct
-	Valid() bool
+	Valid() bool // 判断是否有效
 
 	// All iterators should be closed so that file garbage collection works.
 	Close() error

@@ -17,13 +17,13 @@ import (
 
 type blockIterator struct {
 	data         []byte
-	idx          int // Idx of the entry inside a block
+	idx          int // Idx of the entry inside a block 当前查的block的下标
 	err          error
 	baseKey      []byte
 	key          []byte
 	val          []byte
 	entryOffsets []uint32
-	block        *Block
+	block        *Block // 当前查的bolck
 
 	tableID uint64
 	blockID int
@@ -168,7 +168,7 @@ func (itr *blockIterator) prev() {
 // Iterator is an iterator for a Table.
 type Iterator struct {
 	t    *Table
-	bpos int
+	bpos int // 当前block的下标
 	bi   blockIterator
 	err  error
 
@@ -246,7 +246,7 @@ func (itr *Iterator) seekToLast() {
 // 下面就是要根据目标块的idx来获取该目标块，并且在该目标块内找到的第一个大于等于目标key的元素放在这个itr迭代器对象内
 func (itr *Iterator) seekHelper(blockIdx int, key []byte) {
 	itr.bpos = blockIdx
-	block, err := itr.t.block(blockIdx, itr.useCache()) //NOTE:核心操作，拿到目标block块（先看缓存，没有再去外存）
+	block, err := itr.t.block(blockIdx, itr.useCache()) //NOTE:核心操作，最昂贵的操作，从外存加载目标block块（先看缓存，没有再去外存）NOTE:2025121802
 	if err != nil {
 		itr.err = err
 		return
@@ -268,13 +268,13 @@ func (itr *Iterator) seekFrom(key []byte, whence int) {
 	}
 
 	var ko fb.BlockOffset
-	//下面是个二分查找，注意一个itr迭代器对应一个SST，所以现在是在SST内二分查找
+	//下面是个二分查找，注意一个itr迭代器对应一个SST，所以现在是在SST内二分查找（目的是寻找第一个满足 Block[idx].Smallest > targetKey 的 Block 下标，后面会再执行一个 -1 的操作然后找到目标块）
 	idx := sort.Search(itr.t.offsetsLength(), func(idx int) bool { //遍历块（SST的更低一级的存储单元），idx返回目标key在SST的offset位置(即块的下标)
 		// Offsets should never return false since we're iterating within the OffsetsLength.
-		y.AssertTrue(itr.t.offsets(&ko, idx))
-		return y.CompareKeys(ko.KeyBytes(), key) > 0 //这个就是比较key
+		y.AssertTrue(itr.t.offsets(&ko, idx))        // 得到当前idx块的offset（也就是最小key的offset了！！）
+		return y.CompareKeys(ko.KeyBytes(), key) > 0 //这个就是比较当前block最小key与目标key的大小
 	})
-	if idx == 0 { //没有找到
+	if idx == 0 { //没有找到，处理边界，直接取当前SST第一个block的第一个位置
 		// The smallest key in our table is already strictly > key. We can return that.
 		// 我们表中最小的键已经是>key。我们可以return了。
 		// This is like a SeekToFirst.
@@ -293,8 +293,8 @@ func (itr *Iterator) seekFrom(key []byte, whence int) {
 	// 有两个情况。
 	//  1）block[idx-1]中的所有内容都严格<目标key。在这种情况下，我们应该取block[idx]的第一个元素
 	//  2）block[idx-1]中的某个元素>=key。我们应该去那个元素。
-	itr.seekHelper(idx-1, key) // NOTE:核心操作，去idx-1下标的块内找目标key
-	if itr.err == io.EOF {
+	itr.seekHelper(idx-1, key) // NOTE:核心操作，去idx-1下标的块内找目标key（因为前面找的是第一个Block[idx].Smallest > targetKey的块）
+	if itr.err == io.EOF {     // 这个if是如果block[idx-1]中的所有内容都严格<目标key
 		// Case 1. Need to visit block[idx].
 		// 情况1，需要去block[idx]这个块内找
 		if idx == itr.t.offsetsLength() {
@@ -442,9 +442,9 @@ var (
 // ConcatIterator concatenates the sequences defined by several iterators.  (It only works with
 // TableIterators, probably just because it's faster to not be so generic.)
 type ConcatIterator struct {
-	idx     int // Which iterator is active now.
-	cur     *Iterator
-	iters   []*Iterator // Corresponds to tables.
+	idx     int         // Which iterator is active now.
+	cur     *Iterator   // 当前seek查找到的那个SST的迭代器
+	iters   []*Iterator // Corresponds to tables. 每个SST对应这列表里面的一个迭代器对象
 	tables  []*Table    // Disregarding reversed, this is in ascending order.
 	options int         // Valid options are REVERSED and NOCACHE.
 }
@@ -463,9 +463,9 @@ func NewConcatIterator(tbls []*Table, opt int) *ConcatIterator {
 	}
 	return &ConcatIterator{
 		options: opt,
-		iters:   iters,
-		tables:  tbls,
-		idx:     -1, // Not really necessary because s.it.Valid()=false, but good to have.
+		iters:   iters, // 各个SST对应的迭代器列表
+		tables:  tbls,  // 各个SST
+		idx:     -1,    // Not really necessary because s.it.Valid()=false, but good to have.
 	}
 }
 
@@ -478,7 +478,7 @@ func (s *ConcatIterator) setIdx(idx int) {
 	if s.iters[idx] == nil {
 		s.iters[idx] = s.tables[idx].NewIterator(s.options)
 	}
-	s.cur = s.iters[s.idx]
+	s.cur = s.iters[s.idx] // 设置当前SST的迭代器
 }
 
 // Rewind implements y.Interface
@@ -510,8 +510,11 @@ func (s *ConcatIterator) Value() y.ValueStruct {
 }
 
 // Seek brings us to element >= key if reversed is false. Otherwise, <= key.
+// Next返回下一个>= key的元素。如果与当前键相同，则忽略它。
+// NOTE:2025121801
 func (s *ConcatIterator) Seek(key []byte) {
 	var idx int
+	// 下面这个if找到第一个可能包含 key 或者其内容都在 key 之后的表的下标idx。
 	if s.options&REVERSED == 0 {
 		idx = sort.Search(len(s.tables), func(i int) bool {
 			return y.CompareKeys(s.tables[i].Biggest(), key) >= 0
@@ -528,8 +531,8 @@ func (s *ConcatIterator) Seek(key []byte) {
 	}
 	// For reversed=false, we know s.tables[i-1].Biggest() < key. Thus, the
 	// previous table cannot possibly contain key.
-	s.setIdx(idx)
-	s.cur.Seek(key)
+	s.setIdx(idx)   // 将 ConcatIterator 内部指向当前的表切换为 idx 对应的表
+	s.cur.Seek(key) // 在选定的那个具体表中，执行内部的 Seek 操作，精确定位到具体的 Key-Value 对。
 }
 
 // Next advances our concat iterator.

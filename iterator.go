@@ -433,7 +433,7 @@ var DefaultIteratorOptions = IteratorOptions{
 
 // Iterator helps iterating over the KV pairs in a lexicographically sorted order.
 type Iterator struct {
-	iitr   y.Iterator // 合并的迭代器（二叉树结构，包含当前事务的，内存的，外存的（按level展开））
+	iitr   y.Iterator // 合并的迭代器（二叉归并树结构，实际运行概念上是K路归并算法，包含当前事务的，内存的，外存的（按level展开））
 	txn    *Txn
 	readTs uint64
 
@@ -497,8 +497,10 @@ func (txn *Txn) NewIterator(opt IteratorOptions) *Iterator {
 	// lc是层级管理器(levelcontroler)，下面是对每一层创建一个迭代器，并加在iters对象内（注意0层与其他层处理方式不同）
 	iters = txn.db.lc.appendIterators(iters, &opt) // This will increment references. NOTE:核心操作
 	res := &Iterator{                              // NOTE:471
-		txn:    txn,
-		iitr:   table.NewMergeIterator(iters, opt.Reverse), // NOTE:核心操作，以平衡二叉树为结构组织iters切片（叶子节点就是一个个数据表，且叶子节点从左至右对应数据表的从新到旧（因为前面数据表的加入顺序））
+		txn:  txn,
+		iitr: table.NewMergeIterator(iters, opt.Reverse), // NOTE:核心操作，以平衡二叉树为结构组织iters切片（叶子节点就是一个个数据表，且叶子节点从左至右对应数据表的从新到旧（因为前面数据表的加入顺序）），而非叶节点则是占位用的MergeIterator
+		// NOTE:注意，这里返回的iitr实际上是最顶层的非叶节点MergeIterator，所以iitr.XXX()都是执行的MergeIterator所给定的函数,只不过一般MergeIterator所给定的函数都会向下层传递！！
+		// NOTE:这里的执行运用了特别多的递归调用，比如执行最顶层的.next()会逐层向下执行（注意执行的是非叶节点中small参数指向的决胜者，一直递归到叶子节点来执行具体的指针向后移操作，并且在移动之后会运行fix再次比拼）
 		opt:    opt,
 		readTs: txn.readTs,
 	}
@@ -592,17 +594,19 @@ func (it *Iterator) Next() {
 	if it.iitr == nil {
 		return
 	}
-	// Reuse current item
+	// Reuse current item 重复使用当前项目
 	it.item.wg.Wait()                                                         // Just cleaner to wait before pushing to avoid doing ref counting.//只需在推之前等待清洁，以避免进行引用计数。
 	it.scanned += len(it.item.key) + len(it.item.val) + len(it.item.vptr) + 2 //累计扫描的大小
 	it.waste.push(it.item)                                                    //将当前扫描过的都放到waste里面
 
-	// Set next item to current
+	// Set next item to current 将下一项设置为当前
 	it.item = it.data.pop()
 	for it.iitr.Valid() && hasPrefix(it) {
 		if it.parseItem() { //NOTE:核心操作
 			// parseItem calls one extra next.
 			// This is used to deal with the complexity of reverse iteration.
+			// parseItem调用一个额外的next。
+			// 这用于处理反向迭代的复杂性。
 			break
 		}
 	}
@@ -762,7 +766,7 @@ func hasPrefix(it *Iterator) bool {
 }
 
 func (it *Iterator) prefetch() {
-	prefetchSize := 2
+	prefetchSize := 2 // 默认（也是最少）预读取2个
 	if it.opt.PrefetchValues && it.opt.PrefetchSize > 1 {
 		prefetchSize = it.opt.PrefetchSize
 	}
@@ -793,7 +797,7 @@ func (it *Iterator) Seek(key []byte) {
 	if len(key) > 0 { //非初始化，就是读
 		it.txn.addReadKey(key)
 	}
-	for i := it.data.pop(); i != nil; i = it.data.pop() { // it.data是一个链表，存的是预读取的数据（这里这个操作貌似是把所有预读取的数据移动到waste？）
+	for i := it.data.pop(); i != nil; i = it.data.pop() { // NOTE:it.data是一个链表，存的是预读取的数据。而因为要重新定位各迭代器的位置，所以这里的操作就是把预读取的所有KV清除
 		i.wg.Wait() //做一个小范围的异步，等待vlog中的值读到内存 NOTE:0
 		it.waste.push(i)
 	}
@@ -802,7 +806,7 @@ func (it *Iterator) Seek(key []byte) {
 	if len(key) == 0 {          //如果是初始化，则将prefix设置为要搜索的key
 		key = it.opt.Prefix
 	}
-	if len(key) == 0 {
+	if len(key) == 0 { // 如果是初始化操作，则各迭代器直接取最小值
 		it.iitr.Rewind() //调整迭代器的平衡二叉树，保证range key是从小到大的顺序读取的（当reversed为默认的false时）
 		it.prefetch()    //NOTE:核心操作，预取操作，真的要读了
 		return

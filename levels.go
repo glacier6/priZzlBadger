@@ -913,7 +913,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		// Set TableSize to the target file size for that level.
 		// 将TableSize设置为该级别的目标文件大小。
 		bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
-		builder := table.NewTableBuilder(bopts) //依照SST配置项创建一个生成SST的builder
+		builder := table.NewTableBuilder(bopts) // NOTE:依照SST配置项创建一个生成SST的builder,里面会有加密等相关操作
 
 		// This would do the iteration and add keys to builder.
 		addKeys(builder) //NOTE:核心操作，最核心的操作，内有小循环，把有效的key依次加入到builder（注意，只是加入，并不会在这个里面落盘）

@@ -16,7 +16,7 @@ import (
 type MergeIterator struct {
 	left  node
 	right node
-	small *node
+	small *node // 指向left和right中的决胜者
 
 	curKey  []byte
 	reverse bool
@@ -84,7 +84,7 @@ func (n *node) seek(key []byte) {
 	n.setKey()
 }
 
-func (mi *MergeIterator) fix() { //这个函数做的是一个平衡二叉树的平衡操作，保证下次取最小的item？
+func (mi *MergeIterator) fix() { //这个函数做的是一个二叉归并树的平衡操作，保证下次取最小的item（实际就是开始决胜出各个非叶子节点的左右俩节点中最接近目标值的KEY）
 	if !mi.bigger().valid {
 		return
 	}
@@ -143,8 +143,8 @@ func (mi *MergeIterator) Next() {
 		if !bytes.Equal(mi.small.key, mi.curKey) { //忽略相同key但是版本较低的KV对
 			break
 		}
-		mi.small.next()
-		mi.fix() //再平衡二叉树
+		mi.small.next() // 决胜者向后移动
+		mi.fix()        // 再次开始比拼
 	}
 	mi.setCurrent()
 }
@@ -196,7 +196,7 @@ func (mi *MergeIterator) Close() error {
 
 // NewMergeIterator creates a merge iterator.
 func NewMergeIterator(iters []y.Iterator, reverse bool) y.Iterator {
-	// NewMergeIterator函数递归调用，并会把迭代器切片组织成一个平衡二叉树，之后会对这个二叉树进行左旋右旋等操作，为了方便做range操作，也是生成了一个堆？（利用其惰性排序，就可以不用把所有需要遍历的SST依次遍历，进而提升性能）
+	// NewMergeIterator函数递归调用，并会把迭代器切片组织成一个平衡二叉树（可以说是用二叉归并树实现的K路归并），之后会对这个二叉树进行左旋右旋等操作，为了方便做range操作，也是生成了一个堆？（利用其惰性排序，就可以不用把所有需要遍历的SST依次遍历，进而提升性能）
 	// 这个平衡二叉树的每个叶子节点都是一个子迭代器对象（y.Iterator），父节点则是一个合并迭代器对象（MergeIterator）
 	switch len(iters) {
 	case 0:
