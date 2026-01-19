@@ -259,6 +259,7 @@ func (itr *Iterator) seekHelper(blockIdx int, key []byte) {
 }
 
 // seekFrom brings us to a key that is >= input key.
+// NOTE:2025122300
 func (itr *Iterator) seekFrom(key []byte, whence int) {
 	itr.err = nil
 	switch whence {
@@ -269,6 +270,7 @@ func (itr *Iterator) seekFrom(key []byte, whence int) {
 
 	var ko fb.BlockOffset
 	//下面是个二分查找，注意一个itr迭代器对应一个SST，所以现在是在SST内二分查找（目的是寻找第一个满足 Block[idx].Smallest > targetKey 的 Block 下标，后面会再执行一个 -1 的操作然后找到目标块）
+	// PS：sort.Search做的是二分查找，其内的第一个参数itr.t.offsetsLength()是当前SST的block块数（如100），然后在执行顺序上是二分的，具体来说就是向这个匿名函数（或者闭包函数）传递的idx首先是中位（如50）
 	idx := sort.Search(itr.t.offsetsLength(), func(idx int) bool { //遍历块（SST的更低一级的存储单元），idx返回目标key在SST的offset位置(即块的下标)
 		// Offsets should never return false since we're iterating within the OffsetsLength.
 		y.AssertTrue(itr.t.offsets(&ko, idx))        // 得到当前idx块的offset（也就是最小key的offset了！！）

@@ -42,6 +42,9 @@
     - 7.1 首先，两个缓存都在db初始化的时候开辟出来并把缓存对象存储在db中，对象名字分别为 db.indexCache db.blockCache  
       db.blockCache ，其是在迭代器的对象内使用以及增加块缓存（badger操作的基本单位） ，分别在NOTE:420  以及  NOTE:421处  
       db.indexCache ，缓存的是SST的索引块（就类似开一个元数据的缓存），目前发现用来做布隆过滤器的过滤用,NOTE:422,  其内还会有当前SST中的过时数据大小 NOTE:423  
+      PS:注意 db.indexCache 在创建之后，会在数据库初始化时进行SST在内存中的对象创建时（NOTE:2025122302）通过创建的topt对象（NOTE:2025122301）赋值给SST
+      PS：indexCache的使用都是通过 fetchIndex 函数使用的。（NOTE:2025122303，注意这个函数在下面 第16条 查询时的 4 5 6 步都有用）
+      PS：注意SST的范围是在Levelhandler（内存）中存着的，所以是先根据此找到目标SST，然后再加载目标SST的索引块来判断布隆
     - 7.2 db.blockCache增加以及查询的时机在  
       查询完memtable以及immemtable后未找到，遍历层去找，每层找出可能存在目标K的SST（注意在此会用布隆），然后再在SST内查找（得到目标块的idx），再依据目标块的idx来查缓存以及添加缓存  
 
@@ -80,9 +83,11 @@
   - 16.查询时，依次查看的数据结构是什么（包括索引结构）？
     （1）先看跳表结构的mentable和immemtable NOTE:2025121502
     （2）再开始逐层找目标数据。 NOTE:2025121503
-    （3）先获取各SST在内存中的元数据，对于L0层，获取所有SST的信息，而对于其余有序层，只得到范围包含目标KEY的SST元数据。（注意这个元数据存储在levelHandler的tables中） NOTE:2025121504
+    （3）先获取各SST在内存中的元数据（主要是LevelControler中存的各SST的key范围），对于L0层，获取所有SST的信息，而对于其余有序层，只得到范围包含目标KEY的SST元数据。（注意这个元数据存储在levelHandler的tables中） NOTE:2025121504
         PS：NOTE:注意！！levelHandler的tables的各各SST元数据信息是来自外存的清单文件的！！！！！！！！NOTE:2025121506
-    （4）经过3得到目标SST，然后先匹配目标SST的布隆，看是否是阳性的（SST对应的布隆词条也在levelHandler的tables中）NOTE:2025121505
+    （4）经过3得到目标SST，然后先匹配目标SST的布隆（如果不在，需要从外存加载目标SST的索引块），看是否是阳性的（SST对应的布隆词条也在levelHandler的tables中）NOTE:2025121505
+    （5）再用由该SST创的table类型itr迭代器进行查找，先找到目标KEY所在的block（通过二分查找内存中的索引） NOTE:2025122300
+    （6）最后把这个block从外存加载到内存中（因为采用了MMAP，所以是一页一页通过缺页中断调入内存的），然后二分查找到目标KEY
 
   - 17.levelDB和RocksDB的布隆过滤器应用的对象是LSM树的某一层的key还是某个SST的key？
     注意，是按照SST生成布隆词条的，但是特别注意，有时工程实践时，对于最底层（最大数据层）不会为其维护布隆过滤器，因为这里的数据量太大，维护会消耗很多内存。

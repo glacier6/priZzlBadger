@@ -65,9 +65,9 @@ type Options struct {
 	// Changing BlockSize across DB runs will not break badger. The block size is
 	// read from the block index stored at the end of the table.
 	// 在数据库运行中更改BlockSize不会破坏badger。块大小从存储在表末尾的块索引中读取。
-	BlockSize          int // 块缓存大小
+	BlockSize          int // 单个块缓存大小
 	BloomFalsePositive float64
-	BlockCacheSize     int64
+	BlockCacheSize     int64 // 总块缓存大小
 	IndexCacheSize     int64
 
 	NumLevelZeroTables      int

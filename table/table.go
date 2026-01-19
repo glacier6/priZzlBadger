@@ -512,6 +512,7 @@ func (t *Table) KeySplits(n int, prefix []byte) []string {
 	return res
 }
 
+// NOTE:2025122303
 func (t *Table) fetchIndex() *fb.TableIndex {
 	if !t.shouldDecrypt() {
 		return t._index
@@ -520,7 +521,8 @@ func (t *Table) fetchIndex() *fb.TableIndex {
 	if t.opt.IndexCache == nil {
 		panic("Index Cache must be set for encrypted workloads")
 	}
-	if val, ok := t.opt.IndexCache.Get(t.indexKey()); ok && val != nil {
+	if val, ok := t.opt.IndexCache.Get(t.indexKey()); ok && val != nil { // NOTE:核心操作，这个t.opt.IndexCache实际就是DB.indexCache的一个引用
+		// 在索引缓存中内存中
 		return val
 	}
 
@@ -531,7 +533,7 @@ func (t *Table) fetchIndex() *fb.TableIndex {
 }
 
 func (t *Table) offsets(ko *fb.BlockOffset, i int) bool {
-	return t.fetchIndex().Offsets(ko, i)
+	return t.fetchIndex().Offsets(ko, i) // NOTE:核心操作，fetchIndex用于获取当前SST的索引块，Offsets设置一些偏移量
 }
 
 // block function return a new block. Each block holds a ref and the byte
@@ -557,7 +559,7 @@ func (t *Table) block(idx int, useCache bool) (*Block, error) {
 	}
 	//没在块缓存中找到，下面是去mmap（磁盘）中获取
 	var ko fb.BlockOffset
-	y.AssertTrue(t.offsets(&ko, idx))       //获取第 idx 号块在文件中的 偏移量(Offset) 和 长度(Len)，这一步和下一步应该是要在这个新的块结构体内设置上该块在目标SST的一些信息然后存储在ko结构体中
+	y.AssertTrue(t.offsets(&ko, idx))       //NOTE:先得到索引块（索引缓存有则直接用，否则就去外存加载），然后根据这个索引块获取第 idx 号块在文件中的 偏移量(Offset) 和 长度(Len)，这一步和下一步应该是要在这个新的块结构体内设置上该块在目标SST的一些信息然后存储在ko结构体中
 	blk := &Block{offset: int(ko.Offset())} //先在内存初始化生成一个块结构体
 	blk.ref.Store(1)                        //设置块的引用为1
 	defer blk.decrRef()                     // Deal with any errors, where blk would not be returned.
@@ -672,6 +674,7 @@ func (t *Table) blockCacheKey(idx int) []byte {
 // indexKey returns the cache key for block offsets. blockOffsets
 // are stored in the index cache.
 // indexKey 返回块偏移量（blockOffsets）的缓存键（cache key）。块偏移量（blockOffsets）存储在索引缓存（index cache）中。
+// 下面这个也是索引缓存块的标识
 func (t *Table) indexKey() uint64 {
 	return t.id
 }
@@ -711,7 +714,7 @@ func (t *Table) DoesNotHave(hash uint32) bool {
 	}
 
 	y.NumLSMBloomHitsAdd(t.opt.MetricsEnabled, "DoesNotHave_ALL", 1)
-	index := t.fetchIndex()        //获取当前SST的索引块
+	index := t.fetchIndex()        // NOTE:核心操作，获取当前SST的索引块
 	bf := index.BloomFilterBytes() //做布隆过滤器的过滤 NOTE:422
 	mayContain := y.Filter(bf).MayContain(hash)
 	if !mayContain {

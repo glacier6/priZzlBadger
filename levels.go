@@ -132,7 +132,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 				rerr = y.Wrapf(err, "Error while reading datakey")
 				return
 			}
-			topt := buildTableOptions(db)
+			topt := buildTableOptions(db) // NOTE:2025122301
 			// Explicitly set Compression and DataKey based on how the table was generated.
 			topt.Compression = tf.Compression
 			topt.DataKey = dk
@@ -142,7 +142,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 				rerr = y.Wrapf(err, "Opening file: %q", fname)
 				return
 			}
-			t, err := table.OpenTable(mf, topt)
+			t, err := table.OpenTable(mf, topt) // NOTE:2025122302
 			if err != nil {
 				if strings.HasPrefix(err.Error(), "CHECKSUM_MISMATCH:") {
 					db.opt.Errorf(err.Error())

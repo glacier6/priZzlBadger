@@ -13,7 +13,7 @@ func main() {
 	// NOTE:下面是通用的一些方法，总共需要看6个部分
 
 	// 1.打开DB（DB初始化）
-	db, err := badger.Open(badger.DefaultOptions("/home/hanjiang/DB-CODE/ZZLdgraph/dgraph/p"))
+	db, err := badger.Open(badger.DefaultOptions("/home/hanjiang/DB-CODE/ZZL-go-ycsb/zzl_badger_data"))
 	// db, err := badger.Open(badger.DefaultOptions("./"))
 	if err != nil {
 		log.Fatal(err)
@@ -38,7 +38,7 @@ func main() {
 		txn.Get([]byte("answer"))
 		return nil
 	})
-
+	counter := 0
 	// 4.遍历keys（范围查询），貌似这个代码块没有设置前缀，所以，会把所有数据都返回，然后在下面这个函数参数内进行全部遍历
 	err = db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -74,6 +74,10 @@ func main() {
 			})
 			if err != nil {
 				return err
+			}
+			counter++
+			if counter == 100 {
+				break
 			}
 		}
 		return nil
