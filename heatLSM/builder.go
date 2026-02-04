@@ -12,7 +12,7 @@ const (
 	// 蓄水池容量：叶子节点最多存多少个样本触发分裂检查
 	ReservoirCap = 64
 
-	// 分裂阈值：读+写热度超过此值，且样本满了，才允许分裂
+	// 读分裂阈值：读热度超过此值，且样本满了，才允许分裂（只读热分裂）
 	SplitThreshold = 1000
 
 	// // 聚类间隙阈值 (Gap Threshold)
@@ -25,9 +25,11 @@ type Key []byte
 
 type HeatNode struct {
 	// --- 树形结构与前缀压缩 ---
-	RangeStart  Key
-	RangeEnd    Key // nil 代表无穷大
-	PathSegment Key // 当前节点代表的公共前缀片段。完整 Key = 父节点Prefix + ... + 当前Prefix + Suffix
+	Level          int64 // 当前节点所在层级
+	SplitThreshold int64 // 读分裂阈值：读热度超过此值，且样本满了，才允许分裂（只读热分裂）
+	RangeStart     Key
+	RangeEnd       Key // nil 代表无穷大
+	PathSegment    Key // 当前节点代表的公共前缀片段。完整 Key = 父节点Prefix + ... + 当前Prefix + Suffix
 
 	// --- 热度统计 ---
 	ReadCount  int64 // 原子计数
@@ -65,14 +67,16 @@ type HeatmapManager struct {
 }
 
 // 创建一个新的节点
-func newHeatNode(start, end Key, pathSeg Key, isLeaf bool) *HeatNode {
+func newHeatNode(Level int64, start, end Key, pathSeg Key, isLeaf bool) *HeatNode {
 	n := &HeatNode{
-		RangeStart:  start,
-		RangeEnd:    end,
-		PathSegment: pathSeg,
-		IsLeaf:      isLeaf,
-		ReadCount:   0,
-		WriteCount:  0,
+		Level:          Level,
+		SplitThreshold: 1 << (Level + 10), // TODO:目前第一层1024,第二层2048，第三层4096，需要根据实验调整
+		RangeStart:     start,
+		RangeEnd:       end,
+		PathSegment:    pathSeg,
+		IsLeaf:         isLeaf,
+		ReadCount:      0,
+		WriteCount:     0,
 	}
 	if isLeaf {
 		// 预分配蓄水池，避免频繁扩容
@@ -89,12 +93,12 @@ func NewHeatmapManager() *HeatmapManager {
 	rootEnd := Key(nil)
 
 	// 1. 初始化母树
-	motherRoot := newHeatNode(rootStart, rootEnd, Key{}, true)
+	motherRoot := newHeatNode(0, rootStart, rootEnd, Key{}, true)
 	mother := &HeatmapTree{Root: motherRoot}
 
 	// 2. 初始化子树
 	// 子树初始结构必须与母树一致（完全同构）
-	childRoot := newHeatNode(rootStart, rootEnd, Key{}, true)
+	childRoot := newHeatNode(0, rootStart, rootEnd, Key{}, true)
 	child := &HeatmapTree{Root: childRoot}
 
 	return &HeatmapManager{
@@ -157,9 +161,11 @@ func (n *HeatNode) Evolve() {
 
 	// 1. 基础检查
 	// 如果不是叶子，或者样本太少，则放弃分裂
-	if !n.IsLeaf || len(n.SuffixReservoir) < ReservoirCap {
+	if !n.IsLeaf || n.SplitThreshold > n.ReadCount || len(n.SuffixReservoir) < ReservoirCap {
 		return
 	}
+
+	// TODO:怎么具体分裂
 
 	// 2. 对蓄水池中的后缀进行排序
 	// 这是找中位数的前提
