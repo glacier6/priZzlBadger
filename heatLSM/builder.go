@@ -2,6 +2,8 @@ package heatlsm
 
 import (
 	"bytes"
+	"fmt"
+	"math"
 	"sort"
 	"sync"
 
@@ -12,8 +14,11 @@ const (
 	// 蓄水池容量：叶子节点最多存多少个样本触发分裂检查
 	ReservoirCap = 64
 
-	// 读分裂阈值：读热度超过此值，且样本满了，才允许分裂（只读热分裂）
-	SplitThreshold = 1000
+	// 树节点读写比达到多少停止分裂
+	TargetRatio = 3
+
+	// 树节点分裂时，将蓄水池最多划分多少个有效范围（即一般情况下会划分出（MaxValidRange * 2 + 1）个范围，除非有效范围首位相连了）
+	MaxValidRange = 4
 
 	// // 聚类间隙阈值 (Gap Threshold)
 	// // 在排序后的样本中，如果相邻两个 Key 的差值超过此值，视为“断层”，需要切分出冷桶
@@ -27,6 +32,7 @@ type HeatNode struct {
 	// --- 树形结构与前缀压缩 ---
 	Level          int64 // 当前节点所在层级
 	SplitThreshold int64 // 读分裂阈值：读热度超过此值，且样本满了，才允许分裂（只读热分裂）
+	isTargetRange  bool  // 判断是否是达到TargetRatio的目标节点
 	RangeStart     Key
 	RangeEnd       Key // nil 代表无穷大
 	PathSegment    Key // 当前节点代表的公共前缀片段。完整 Key = 父节点Prefix + ... + 当前Prefix + Suffix
@@ -36,8 +42,9 @@ type HeatNode struct {
 	WriteCount int64 // 原子计数
 
 	// --- 结构控制 ---
-	IsLeaf   bool
-	Children []*HeatNode // 这里使用有序切片存储子节点，分裂不固定为2,可为N个
+	IsLeaf        bool
+	Children      []*HeatNode // 这里使用有序切片存储子节点，分裂不固定为2,可为N个
+	SplitRangeKey []Key       // 分裂点列表，即Children中前【len(Children)-1】个的RangeEnd值
 
 	// --- 进化基因 (仅叶子节点有效) ---
 	// 只在叶子节点存在，且存储的是去掉从 Root 到当前节点所有 Prefix 后的剩余部分
@@ -55,6 +62,9 @@ type HeatmapTree struct {
 }
 
 type HeatmapManager struct {
+	TotalRead  int64
+	TotalWrite int64
+
 	// 母树：结构稳定，负责指导路由，记录长期衰减热度
 	MotherTree *HeatmapTree
 
@@ -77,6 +87,7 @@ func newHeatNode(Level int64, start, end Key, pathSeg Key, isLeaf bool) *HeatNod
 		IsLeaf:         isLeaf,
 		ReadCount:      0,
 		WriteCount:     0,
+		isTargetRange:  false,
 	}
 	if isLeaf {
 		// 预分配蓄水池，避免频繁扩容
@@ -104,10 +115,12 @@ func NewHeatmapManager() *HeatmapManager {
 	return &HeatmapManager{
 		MotherTree: mother,
 		ChildTree:  child,
+		TotalRead:  0,
+		TotalWrite: 0,
 	}
 }
 
-// NOTE:核心逻辑：向蓄水池添加样本，现在下面这个是针对全局的。TODO:看看是否有必要将近期查询KEY进入的可能性拉大
+// NOTE:核心逻辑：向蓄水池添加样本，现在下面这个是针对全局的。TODO:看看是否有必要将近期查询KEY进入的可能性拉大 // TODO:当某个key刚好等于路径上的片段key拼接呢？
 // keySuffix: 已经剥离了当前节点 Prefix 的后缀部分
 func (n *HeatNode) AddSample(keySuffix Key) {
 	n.Lock()
@@ -161,109 +174,200 @@ func (n *HeatNode) Evolve() {
 
 	// 1. 基础检查
 	// 如果不是叶子，或者样本太少，则放弃分裂
-	if !n.IsLeaf || n.SplitThreshold > n.ReadCount || len(n.SuffixReservoir) < ReservoirCap {
+	if !n.IsLeaf || n.isTargetRange || n.SplitThreshold > n.ReadCount || len(n.SuffixReservoir) < ReservoirCap {
 		return
 	}
 
-	// TODO:怎么具体分裂
+	// 当前范围符合标准，暂停继续分裂
+	if n.WriteCount > 0 && n.ReadCount/n.WriteCount > TargetRatio {
+		// TODO:当前范围符合标准，暂停分裂，将当前范围添加到某个地方记录起来
+	}
 
-	// 2. 对蓄水池中的后缀进行排序
-	// 这是找中位数的前提
+	// 2. 先对蓄水池中的Key后缀进行排序
 	sort.Slice(n.SuffixReservoir, func(i, j int) bool {
 		return bytes.Compare(n.SuffixReservoir[i], n.SuffixReservoir[j]) < 0
 	})
 
-	// 3. 提取最长公共前缀 (LCP)
-	// 只需要比对排序后的第一个和最后一个样本
-	first := n.SuffixReservoir[0]
-	last := n.SuffixReservoir[len(n.SuffixReservoir)-1]
-	lcp := longestCommonPrefix(first, last)
+	// NOTE:怎么具体分裂？
+	// （1）在已排序的蓄水池上先找到前缀不同的候补分裂点（如111,121,211，269,359的候补分裂点应该是index为2,4之前的位置），然后尽可能均分的找到 MaxValidRange-1（最多） 个分裂点   PS:这是为了尽可能扁平化，加速查找流程
+	// （2）生成对应个数个子节点，并且对于各有效区域且有公共前缀的在子节点设置上前缀名，即设置上PathSegment
+	// （3）将子节点挂载到父节点上，并且在父节点的SplitRangeKey中更新分裂点列表
+	alternateIndex := []int{}
+	lastByte := n.SuffixReservoir[0][0]
+	for i := 1; i < ReservoirCap; i++ {
+		var currByte byte
+		if len(n.SuffixReservoir[i]) > 0 {
+			currByte = n.SuffixReservoir[i][0]
+		}
+		if currByte != lastByte {
+			alternateIndex = append(alternateIndex, i)
+			lastByte = currByte
+		}
+	}
+	childrenNodes, splitKeys := n.splitReservoir(n.SuffixReservoir, alternateIndex, MaxValidRange)
+	fmt.Print(childrenNodes)
+	fmt.Print(splitKeys)
+	// TODO:下面还需要补充一些逻辑
 
-	// 4. TODO:边界处理：如果所有样本完全一样 (LCP == sample)，无法分裂
-	// 这通常发生在对同一个 Key 进行疯狂写入时
-	// if len(lcp) == len(first) && len(lcp) == len(last) {
-	// 	// 策略：清空样本，重新收集，或者标记为不可分裂节点
-	// 	n.SuffixReservoir = n.SuffixReservoir[:0]
-	// 	n.TotalSamplesSeen = 0
-	// 	return
-	// }
+}
 
-	// 5. 更新当前节点的路径信息 (Push Down LCP)
-	// 如果发现了新的公共前缀，将其合并到当前节点的 PathSegment 中
-	if len(lcp) > 0 {
-		n.PathSegment = append(n.PathSegment, lcp...)
+// splitReservoir 将样本数据 data 基于 potentialIndices 进行分割，并构造子节点
+// data: 父节点的蓄水池样本（相对 Key）
+// potentialIndices: 候选切割点的下标列表(是分裂点之后的那个key的下标)
+// n: 目标最大块数
+func (node *HeatNode) splitReservoir(data []Key, potentialIndices []int, targetBlocks int) ([]*HeatNode, []Key) {
+	totalLen := len(data)
+	var chosenIndices []int // 切割下标
 
-		// 关键：所有样本都需要剥离掉这个新的 LCP
-		for i := range n.SuffixReservoir {
-			n.SuffixReservoir[i] = n.SuffixReservoir[i][len(lcp):]
+	// 1. 边界检查：如果只要1块或没法分，直接返回原数组
+	if len(potentialIndices) != 0 {
+		neededCuts := targetBlocks - 1
+		if len(potentialIndices) <= neededCuts {
+			// 情况A：提供的切割点不够用，或者刚好够用
+			chosenIndices = potentialIndices
+		} else {
+			// 情况B：提供的切割点绰绰有余，我们需要贪心选择最均匀的点
+			chosenIndices = make([]int, 0, neededCuts)
+			step := float64(totalLen) / float64(targetBlocks) // 理想步长
+			lastIdxInPotentials := -1                         // 记录上一次在 potentialIndices 中选中的下标，防止回头或重复
+			// 下面开始贪心找切割点
+			for i := 1; i <= neededCuts; i++ {
+				// 当前这一刀的理想位置
+				idealPos := step * float64(i)
+
+				// 在 potentialIndices 中二分查找最接近 idealPos 的位置
+				// SearchInts 返回第一个 >= idealPos 的下标
+				idx := sort.SearchInts(potentialIndices, int(idealPos))
+
+				// 寻找最接近的下标 (idx 还是 idx-1 ?)
+				bestMatchIdx := -1
+
+				// 边界处理
+				if idx == 0 {
+					bestMatchIdx = 0
+				} else if idx == len(potentialIndices) {
+					bestMatchIdx = len(potentialIndices) - 1
+				} else {
+					// 比较 idx 和 idx-1 谁离理想值更近
+					valAfter := potentialIndices[idx]
+					valBefore := potentialIndices[idx-1]
+					if math.Abs(float64(valAfter)-idealPos) < math.Abs(float64(valBefore)-idealPos) {
+						bestMatchIdx = idx
+					} else {
+						bestMatchIdx = idx - 1
+					}
+				}
+
+				// --- 关键修正逻辑 ---
+
+				// 1. 必须大于上一次选中的下标（保证不重复选同一个点，且顺序往后）
+				if bestMatchIdx <= lastIdxInPotentials {
+					bestMatchIdx = lastIdxInPotentials + 1
+				}
+
+				// 2. 必须为后面还没切的刀数预留足够的点位
+				// 还需要切 cutsRemaining 刀
+				cutsRemaining := neededCuts - i
+				// 后面还剩多少个候选点
+				candidatesRemaining := len(potentialIndices) - 1 - bestMatchIdx
+
+				// 如果选了这个点，导致后面剩下的候选点不够切了，就必须强行把当前点往前移
+				if candidatesRemaining < cutsRemaining {
+					bestMatchIdx = len(potentialIndices) - 1 - cutsRemaining
+				}
+
+				// 选中该点
+				chosenIndices = append(chosenIndices, potentialIndices[bestMatchIdx])
+				lastIdxInPotentials = bestMatchIdx
+			}
 		}
 	}
 
-	// 6. 寻找中位数作为分裂点
-	// 注意：此时的样本已经剥离了最新的 LCP
-	midIdx := len(n.SuffixReservoir) / 2
+	// 5. 根据选中的下标构造子节点
+	var children []*HeatNode
+	var splitKeys []Key
+	start := 0
 
-	// SplitSuffix 是右子树的起始边界（相对路径）
-	// splitSuffix := n.SuffixReservoir[midIdx]
+	// 为了正确设置 RangeStart 和 RangeEnd，我们需要知道父节点的绝对 Start 吗？
+	// 假设我们在设计中使用相对 Key。
+	// 第一个子节点的 Start = 父节点的 Start (逻辑上，如果是相对值则是空)
+	// 最后一个子节点的 End = 父节点的 End
 
-	// 7. 创建子节点
-	// 继承一半的热度 (简单衰减策略，防止分裂后瞬间变冷)
-	halfRead := n.ReadCount / 2
-	halfWrite := n.WriteCount / 2
+	// 在这里，我们只维护相对逻辑：
+	// Child.RangeStart = (相对于 Child.PathSegment 的空 byte?)
+	// 实际上，RangeStart/End 在 LSM 中更多是用于 Seek/Iterate 的边界检查。
+	// 既然 Node 里有 PathSegment，我们让 RangeStart/End 也是相对于 PathSegment 的。
 
-	// 左孩子：覆盖 [Min, splitSuffix)
-	leftChild := &HeatNode{
-		PathSegment: nil, // 左孩子相对于父节点没有额外的固定前缀
-		ReadCount:   halfRead,
-		WriteCount:  halfWrite,
-		IsLeaf:      true,
-		// 将左半部分样本遗传给左孩子
-		SuffixReservoir:  n.SuffixReservoir[:midIdx],
-		TotalSamplesSeen: int64(midIdx),
+	// 需要追加一个“虚拟”的结束点 totalLen，方便循环
+	cutPoints := append(chosenIndices, totalLen)
+	for i, cutPos := range cutPoints {
+		// 提取分片样本
+		if cutPos > totalLen {
+			cutPos = totalLen
+		}
+		chunk := data[start:cutPos]
+		rangeSize := int64(cutPos - start)
+
+		// 计算这一组样本的公共前缀，作为子节点的 PathSegment
+		commonSeg := calcCommonPrefix(chunk)
+
+		// 构造子节点
+		// 注意：RangeStart 和 RangeEnd 在这里比较难精确定义，除非我们传递上下文。
+		// 简单起见，我们暂且置空或设为 nil，因为核心路由靠 SplitRangeKey。
+		child := newHeatNode(
+			node.Level+1,
+			nil, // RangeStart TODO:写范围
+			nil, // RangeEnd
+			commonSeg,
+			true,
+		)
+
+		// 继承热度 (简单均分)
+		child.ReadCount = node.ReadCount / (rangeSize / ReservoirCap)
+		child.WriteCount = node.WriteCount / (rangeSize / ReservoirCap)
+
+		// TODO:下面的需要再看一下逻辑
+		// 将样本迁移进子节点
+		// 【关键】：必须剥离掉子节点的 PathSegment (commonSeg)
+		for _, key := range chunk {
+			if len(key) >= len(commonSeg) {
+				// 剥离前缀
+				suffix := key[len(commonSeg):]
+				// 需要深拷贝吗？AddSample 内部会做深拷贝。
+				// 但这里的 suffix 是基于 data 的切片，data 是 n.SuffixReservoir。
+				// 如果 n.SuffixReservoir 被置 nil，底层数组还能用吗？
+				// Go 的 GC 会管理引用，只要 AddSample 拷贝了就没问题。
+				child.AddSample(suffix)
+			}
+		}
+
+		children = append(children, child)
+
+		// 记录分裂点 (SplitKey)
+		// SplitKey 应该是前一个子节点的“上界”或后一个子节点的“下界”。
+		// 在 B+ 树中，通常 SplitKey 是右子树的最小值。
+		// 这里，我们取 chunk[0] (该组的第一个 Key) 作为该组的下界？
+		// 不，SplitKeys 列表长度应该是 len(Children) - 1。
+		// SplitKeys[i] 分隔 Children[i] 和 Children[i+1]。
+		// 所以 SplitKeys[i] 应该是 Children[i+1] 的逻辑下界。
+
+		// 这里的逻辑下界是：Children[i+1].PathSegment + ...
+		// 但 SplitRangeKey 存储在父节点，父节点看来，
+		// Key = Child.PathSegment + Child.Suffix
+		// 所以 SplitKey 应该是：下一个 Chunk 的第一个样本（全量相对父节点）。
+
+		if i < len(cutPoints)-1 {
+			// 获取下一个 Chunk 的第一个元素
+			nextChunkStartIdx := cutPos
+			if nextChunkStartIdx < totalLen {
+				splitKey := make(Key, len(data[nextChunkStartIdx]))
+				copy(splitKey, data[nextChunkStartIdx])
+				splitKeys = append(splitKeys, splitKey)
+			}
+		}
+
+		start = cutPos
 	}
 
-	// 右孩子：覆盖 [splitSuffix, Max)
-	// 注意：右孩子的 PathSegment 就是 splitSuffix 的第一个字节吗？
-	// 不一定。为了简单起见，我们在 Radix Tree 中通常不给子节点预设 Path，
-	// 而是等子节点下次分裂时自己去提取 LCP。
-	// 但为了路由正确，我们需要知道右边的范围从哪里开始。
-	// 在这种简化模型下，路由逻辑通常由父节点根据 SplitKey 判断。
-
-	rightChild := &HeatNode{
-		PathSegment: nil,
-		ReadCount:   halfRead,
-		WriteCount:  halfWrite,
-		IsLeaf:      true,
-		// 将右半部分样本遗传给右孩子
-		SuffixReservoir:  n.SuffixReservoir[midIdx:],
-		TotalSamplesSeen: int64(len(n.SuffixReservoir) - midIdx),
-	}
-
-	// *修正：如果是多路树结构，我们需要把 splitSuffix 存下来作为路由依据
-	// 但在这里，我们先构建 Children 列表，路由时依赖子节点的 Range 或者辅助索引
-	// 为了简化，假设父节点变成中间节点后，路由逻辑是：
-	// Key < splitSuffix -> Child[0]
-	// Key >= splitSuffix -> Child[1]
-	// 我们需要把这个 splitSuffix 记录在某个地方，或者让右孩子的 PathSegment 暂时承载它。
-	// 这里最简单的做法是：不预设子节点的 PathSegment，依靠下一次迭代提取。
-
-	n.Children = []*HeatNode{leftChild, rightChild}
-
-	// 8. 状态变更
-	n.IsLeaf = false
-	n.SuffixReservoir = nil // 清空父节点样本
-	n.TotalSamplesSeen = 0
-}
-
-// 辅助函数：计算两个字节切片的公共前缀
-func longestCommonPrefix(a, b Key) Key {
-	maxLen := len(a)
-	if len(b) < maxLen {
-		maxLen = len(b)
-	}
-	i := 0
-	for i < maxLen && a[i] == b[i] {
-		i++
-	}
-	return a[:i]
+	return children, splitKeys
 }
