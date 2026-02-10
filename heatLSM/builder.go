@@ -34,9 +34,9 @@ type HeatNode struct {
 	Level          int64 // 当前节点所在层级
 	SplitThreshold int64 // 读分裂阈值：读热度超过此值，且样本满了，才允许分裂（只读热分裂）
 	isTargetRange  bool  // 判断是否是达到TargetRatio的目标节点
-	RangeStart     Key   // RangeStart和RangeEnd构造出左闭右开的区间（注意这俩是针对父亲的范围分割，且同一层的节点范围合并起来就是父节点的全域）
+	RangeStart     Key   // RangeStart和RangeEnd构造出左闭右开的区间（注意这俩是针对父亲的范围分割，且同一层的节点范围合并起来就是父节点的全域，即向上看。且注意存储的是逐层拼接的增量Key）
 	RangeEnd       Key   // nil 代表无穷大
-	PathSegment    Key   // 当前节点代表的公共前缀片段。完整 Key = 父节点Prefix + ... + 当前Prefix + Suffix
+	PathSegment    Key   // 当前节点代表的公共前缀片段。完整 Key = 父节点Prefix + ... + 当前Prefix + Suffix（注意是逐层拼接的增量Key）
 
 	// --- 热度统计 ---
 	ReadCount  int64 // 原子计数
@@ -45,7 +45,7 @@ type HeatNode struct {
 	// --- 结构控制 ---
 	IsLeaf        bool
 	Children      []*HeatNode // 这里使用有序切片存储子节点，分裂不固定为2,可为N个
-	SplitRangeKey []Key       // 分裂点列表，即Children中前【len(Children)-1】个的RangeEnd值
+	SplitRangeKey []Key       // 分裂点列表，即Children中前【len(Children)-1】个的RangeEnd值（注意存的是逐层拼接的增量Key）
 
 	// --- 进化基因 (仅叶子节点有效) ---
 	// 只在叶子节点存在，且存储的是去掉从 Root 到当前节点所有 Prefix 后的剩余部分
@@ -77,7 +77,7 @@ type HeatmapManager struct {
 }
 
 // 创建一个新的节点
-func newHeatNode(Level int64, start, end Key, pathSeg Key, iniReservoir []Key, iniResPath Key, iniReadCount int64, iniWriteCount int64) *HeatNode {
+func newHeatNode(Level int64, start, end Key, pathSeg Key, iniReservoir []Key, iniReadCount int64, iniWriteCount int64) *HeatNode {
 	n := &HeatNode{
 		Level:          Level,
 		SplitThreshold: 1 << (Level + 10), // TODO:目前第一层1024,第二层2048，第三层4096，需要根据实验调整
@@ -95,14 +95,14 @@ func newHeatNode(Level int64, start, end Key, pathSeg Key, iniReservoir []Key, i
 	// 将蓄水池对应部分迁移进子节点
 	// 【关键】：必须剥离掉子节点的 PathSegment (commonSeg)
 	for _, key := range iniReservoir {
-		if len(key) >= len(iniResPath) {
+		if len(key) >= len(pathSeg) {
 			// 剥离前缀
-			suffix := key[len(iniResPath):]
+			suffix := key[len(pathSeg):]
 			// 需要深拷贝吗？AddSample 内部会做深拷贝。
 			// 但这里的 suffix 是基于 data 的切片，data 是 n.SuffixReservoir。
 			// 如果 n.SuffixReservoir 被置 nil，底层数组还能用吗？
 			// Go 的 GC 会管理引用，只要 AddSample 拷贝了就没问题。
-			n.AddSample(suffix)
+			n.AddSample(suffix, true)
 		}
 	}
 	return n
@@ -116,12 +116,12 @@ func NewHeatmapManager() *HeatmapManager {
 	rootEnd := Key(nil)
 
 	// 1. 初始化母树
-	motherRoot := newHeatNode(0, rootStart, rootEnd, Key{}, []Key{}, Key{}, 0, 0)
+	motherRoot := newHeatNode(0, rootStart, rootEnd, Key{}, []Key{}, 0, 0)
 	mother := &HeatmapTree{Root: motherRoot}
 
 	// 2. 初始化子树
 	// 子树初始结构必须与母树一致（完全同构）
-	childRoot := newHeatNode(0, rootStart, rootEnd, Key{}, []Key{}, Key{}, 0, 0)
+	childRoot := newHeatNode(0, rootStart, rootEnd, Key{}, []Key{}, 0, 0)
 	child := &HeatmapTree{Root: childRoot}
 
 	return &HeatmapManager{
@@ -134,9 +134,8 @@ func NewHeatmapManager() *HeatmapManager {
 
 // NOTE:核心逻辑：向蓄水池添加样本，现在下面这个是针对全局的，注意调用下面这个函数需要先找到目标叶子节点，并且确保当前Key在目标叶子节点的边界内（左闭右开）。
 // TODO:看看是否有必要将近期查询KEY进入的可能性拉大
-// TODO:看看把这个函数放在哪里
 // keySuffix: 已经剥离了当前节点 Prefix 的后缀部分
-func (n *HeatNode) AddSample(keySuffix Key) {
+func (n *HeatNode) AddSample(keySuffix Key, isRead bool) {
 	n.Lock()
 	defer n.Unlock()
 
@@ -146,7 +145,15 @@ func (n *HeatNode) AddSample(keySuffix Key) {
 	}
 
 	// 2. 计数器自增 (代表这是第 N 个流过的数据)
-	n.TotalSamplesSeen++
+	// n.TotalSamplesSeen++
+	if isRead {
+		n.ReadCount++
+	} else {
+		n.WriteCount++
+		return // 蓄水池里面只放读的key
+		// TODO:TODO:但现在有一个问题，就是写的count子节点如何继承呢？因为密集读的位置未必是密集写啊
+		// TODO:TODO:还有一个问题，就是读肯定要通过某种方式衰退的，但是写我要不要衰退呢？
+	}
 
 	// 3. 场景 A: 蓄水池未满 -> 直接追加
 	if len(n.SuffixReservoir) < ReservoirCap {
@@ -165,7 +172,7 @@ func (n *HeatNode) AddSample(keySuffix Key) {
 
 	// 生成一个 [0, n) 的随机数，此处引入一个高性能随机数库
 	// 因为标准库 math/rand通常使用较为复杂的伪随机算法（如 Lagged Fibonacci 或 PCG 算法）。这些算法产生的随机数分布质量很高，周期很长，可以通过统计学检验。但计算步骤相对繁琐。
-	limit := uint32(n.TotalSamplesSeen)
+	limit := uint32(n.ReadCount)
 	r := fastrand.Uint32n(limit) // Uint32n 返回范围在 [0..maxN) 内的伪随机 uint32 值。从并发的goroutine中调用此函数是安全的。
 
 	// 如果随机数落在 [0, k) 区间内，则替换掉对应下标的元素
@@ -178,26 +185,21 @@ func (n *HeatNode) AddSample(keySuffix Key) {
 		n.SuffixReservoir[r] = k
 	}
 
-	// TODO:写分裂的条件判断语句，并且尝试分裂
+	// 判断是否满足分裂条件，写'&&'性能更高(不需要比较所有即可得出结果)
+	if n.ReadCount > n.SplitThreshold && n.WriteCount > 0 && n.ReadCount/n.WriteCount > TargetRatio && len(n.SuffixReservoir) == ReservoirCap {
+		// 当前范围符合标准，允许分裂
+		// TODO:将当前范围添加到某个地方记录起来
+		n.Evolve() // NOTE:核心操作，进行分裂
+	}
 }
 
 // Evolve 是核心分裂方法，通常由后台 Worker 调用，或者在 Write 路径中异步触发
+// NOTE:调用前请确保n满足分裂的条件！！
 func (n *HeatNode) Evolve() {
-	n.Lock()
+	n.Lock() // 加写锁
 	defer n.Unlock()
 
-	// 1. 基础检查
-	// 如果不是叶子，或者样本太少，则放弃分裂
-	if !n.IsLeaf || n.isTargetRange || n.SplitThreshold > n.ReadCount || len(n.SuffixReservoir) < ReservoirCap {
-		return
-	}
-
-	// 当前范围符合标准，暂停继续分裂
-	if n.WriteCount > 0 && n.ReadCount/n.WriteCount > TargetRatio {
-		// TODO:当前范围符合标准，暂停分裂，将当前范围添加到某个地方记录起来
-	}
-
-	// 2. 先对蓄水池中的Key后缀进行排序
+	// 先对蓄水池中的Key后缀进行排序
 	sort.Slice(n.SuffixReservoir, func(i, j int) bool {
 		return bytes.Compare(n.SuffixReservoir[i], n.SuffixReservoir[j]) < 0
 	})
@@ -242,8 +244,8 @@ func (node *HeatNode) splitReservoir(data []Key, PrefixGroups []ResIndexRange) (
 	rangeWriteCount := float64(node.WriteCount)
 	// 遍历选中的区间（每一轮最多可以增加3个子节点【头部间隙节点、当前具有公共前缀的区间节点、尾部间隙节点】）
 	for i, oneRange := range PrefixGroups {
-		//为子节点拼接路径
-		childPathSegment := MergeKey(node.PathSegment, oneRange.CommonPrefix)
+		// 为子节点拼接路径 NOTE:先只保存相对Key
+		// childPathSegment := MergeKey(node.PathSegment, oneRange.CommonPrefix)
 
 		// 注意头部间隙是必定存在的，因为oneRange区间必定有共有前缀，所以头部间隙的头部和第一个区间的头部必定不同
 		if i == 0 {
@@ -252,29 +254,27 @@ func (node *HeatNode) splitReservoir(data []Key, PrefixGroups []ResIndexRange) (
 			rangeRation = float64(oneRange.Start) / float64(ReservoirCap)
 			frontChild := newHeatNode(
 				nextLevel,
-				node.RangeStart,  // 设置父节点的开始为第一个孩子的开始
-				childPathSegment, // 设置第一个区间的start为第一个孩子的结尾
-				node.PathSegment, // 设置父节点的路径片段为头部间隙的路径片段
+				node.RangeStart,       // 设置父节点的开始为第一个孩子的开始
+				oneRange.CommonPrefix, // 设置第一个区间的start（即区间的公共前缀）为第一个孩子的结尾
+				Key{},                 // 空隙节点无公共前缀
 				data[0:oneRange.Start],
-				Key{},
 				int64(rangeReadCount*rangeRation),
 				int64(rangeWriteCount*rangeRation),
 			)
 			children = append(children, frontChild)
-			splitKeys = append(splitKeys, childPathSegment)
+			splitKeys = append(splitKeys, oneRange.CommonPrefix)
 		}
 
 		// 加入目前区域的子节点
 		rangeRation = float64(oneRange.End-oneRange.Start) / ReservoirCap // 自动转型
-		childRangeEnd := NextKeySameLength(childPathSegment)              // 将前缀+1设置为结尾
+		childRangeEnd := NextKeySameLength(oneRange.CommonPrefix)         // 将前缀+1设置为结尾
 		// 构造子节点
 		child := newHeatNode(
 			nextLevel,
-			childPathSegment,                  // 设置当前区间的共有前缀为开始
+			oneRange.CommonPrefix,             // 设置当前区间的共有前缀为开始
 			childRangeEnd,                     // 设置当前区间的共有前缀+1为结束
-			childPathSegment,                  // 设置上路径片段
+			oneRange.CommonPrefix,             // 设置上路径片段
 			data[oneRange.Start:oneRange.End], // 传递当前区间的Key
-			oneRange.CommonPrefix,             // 用于剔除当前区间共有前缀
 			int64(rangeReadCount*rangeRation),
 			int64(rangeWriteCount*rangeRation),
 		)
@@ -288,7 +288,7 @@ func (node *HeatNode) splitReservoir(data []Key, PrefixGroups []ResIndexRange) (
 			afterChildIndexEnd = ReservoirCap
 		} else {
 			// 如果是普通的区间之间间隙
-			afterChildRangeEnd = MergeKey(node.PathSegment, PrefixGroups[i+1].CommonPrefix)
+			afterChildRangeEnd = PrefixGroups[i+1].CommonPrefix
 			afterChildIndexEnd = PrefixGroups[i+1].Start
 		}
 
@@ -299,10 +299,9 @@ func (node *HeatNode) splitReservoir(data []Key, PrefixGroups []ResIndexRange) (
 			afterChild := newHeatNode(
 				nextLevel,
 				childRangeEnd,      // 将当前区间的尾部设置为间隙的开始
-				afterChildRangeEnd, // 将下一区间(或者父亲的尾)的头部设置为间隙的结束
-				node.PathSegment,   // 设置父节点的路径片段为尾部间隙的路径片段
+				afterChildRangeEnd, // 将下一区间的头部(或者父亲的尾)设置为间隙的结束
+				Key{},              // 空隙节点无公共前缀
 				data[oneRange.End:afterChildIndexEnd],
-				Key{},
 				int64(rangeReadCount*rangeRation),
 				int64(rangeWriteCount*rangeRation),
 			)
@@ -314,4 +313,67 @@ func (node *HeatNode) splitReservoir(data []Key, PrefixGroups []ResIndexRange) (
 	}
 
 	return children, splitKeys
+}
+
+// SearchLeaf 根据输入的 Key 查找其所属的叶子节点（注意用的是迭代，这样避免了锁的竞争，提高了高并发行能）
+// Key: 完整的 Key（绝对路径）
+// needAddSample: 是否需要增加样本
+// 返回值: 包含该 Key 范围的 *HeatNode，如果路径不匹配则可能返回 nil
+func (n *HeatNode) SearchLeaf(key Key, isRead bool) *HeatNode {
+	current := n
+	// searchSuffix 随着层级下沉，会不断被切掉前缀，变成相对 Key
+	searchSuffix := key
+
+	for {
+		// 1. 加读锁，保护当前节点的 PathSegment, SplitRangeKey, Children 等结构
+		current.RLock()
+
+		// 2. 检查前缀匹配
+		// 既然是 Trie 树结构，Key 必须包含当前节点的 PathSegment
+		if !bytes.HasPrefix(searchSuffix, current.PathSegment) {
+			current.RUnlock()
+			// 如果前缀不匹配，说明这个 Key 不在这个树的分支路径上
+			// 视具体业务需求，这里可以返回 nil，或者返回当前节点（作为最接近的节点）
+			// 这里返回 nil 表示“路径不通”
+			return nil
+		}
+
+		// 3. 如果是叶子节点，这就是我们要找的目标
+		if current.IsLeaf {
+			current.RUnlock()
+			current.AddSample(searchSuffix, isRead) // NOTE:核心操作，尝试追加样本
+			return current
+		}
+
+		// 4. 剥离前缀，准备下一层的路由
+		// 下一层子节点的 SplitKey 是相对于当前节点 PathSegment 之后的后缀
+		prefixLen := len(current.PathSegment)
+		// 此时 searchSuffix 长度一定 >= prefixLen，因为前面 HasPrefix 检查过了
+		remainingKey := searchSuffix[prefixLen:]
+
+		// 5. 二分查找确定子节点索引
+		// SplitRangeKey 存储的是分割点（子节点的上界，左闭右开原则）
+		// 我们需要找到第一个 SplitKey > remainingKey 的位置 index
+		// 这样 remainingKey 就属于 Children[index]
+		idx := sort.Search(len(current.SplitRangeKey), func(i int) bool {
+			// 比较：SplitKey > remainingKey
+			return bytes.Compare(current.SplitRangeKey[i], remainingKey) > 0
+		})
+
+		// 6. 确定下一跳子节点
+		// 如果 idx == len(SplitRangeKey)，说明 remainingKey >= 所有分割点，属于最后一个子节点
+		// 注意：Children 的数量通常比 SplitRangeKey 多 1
+		if idx >= len(current.Children) {
+			// 防御性检查，理论上 SplitKey 数量 = len(Children) - 1
+			// 如果出现越界，回退到最后一个孩子
+			idx = len(current.Children) - 1
+		}
+
+		nextChild := current.Children[idx]
+
+		// 7. 释放当前节点锁，指针下移，更新搜索用的后缀
+		current.RUnlock()
+		current = nextChild
+		searchSuffix = remainingKey
+	}
 }

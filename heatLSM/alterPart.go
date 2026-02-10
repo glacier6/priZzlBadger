@@ -183,3 +183,96 @@ package heatlsm
 
 // 	return children, splitKeys
 // }
+
+// 下面是在heatNode保存完整路径的代码
+// NOTE:现在有个问题，到底要不要用前缀PathSegment
+// 1.如果用了话，就必须增加空隙节点（会增多节点的个数），但感觉会更精准，而且空隙节点也不会多很多？ NOTE:先实现这一个吧！！！
+// 2.而如果不用的话，完整key存放，此时虽然减少了空隙节点，但是会极大增加每个节点的大小，而且应该如何去找分裂点呢？
+// 3.又或者取一个折衷的方式？用前缀，但PathSegment不是看蓄水池key的公共前缀，而是看当前节点的首尾范围前缀？（但这个首尾的基本不就一定不会有公共前缀了？）
+
+// splitReservoir 将样本数据 data 基于 PrefixGroups 进行分割，并构造子节点
+// data: 父节点的蓄水池样本（相对 Key）
+// PrefixGroups: 具有公共前缀且最长的的区间列表(NOTE:是分裂点之后的那个key的下标)
+// func (node *HeatNode) splitReservoir(data []Key, PrefixGroups []ResIndexRange) ([]*HeatNode, []Key) {
+// 	var children []*HeatNode
+// 	var splitKeys []Key
+
+// 	nextLevel := node.Level + 1
+// 	rangeRation := 0.0
+// 	rangeReadCount := float64(node.ReadCount)
+// 	rangeWriteCount := float64(node.WriteCount)
+// 	// 遍历选中的区间（每一轮最多可以增加3个子节点【头部间隙节点、当前具有公共前缀的区间节点、尾部间隙节点】）
+// 	for i, oneRange := range PrefixGroups {
+// 		//为子节点拼接路径
+// 		childPathSegment := MergeKey(node.PathSegment, oneRange.CommonPrefix)
+
+// 		// 注意头部间隙是必定存在的，因为oneRange区间必定有共有前缀，所以头部间隙的头部和第一个区间的头部必定不同
+// 		if i == 0 {
+// 			// 现在需要加头部间隙
+// 			// frontRS :=
+// 			rangeRation = float64(oneRange.Start) / float64(ReservoirCap)
+// 			frontChild := newHeatNode(
+// 				nextLevel,
+// 				node.RangeStart,       // 设置父节点的开始为第一个孩子的开始
+// 				childPathSegment, // 设置第一个区间的start为第一个孩子的结尾
+// 				node.PathSegment,      // 设置父节点的路径片段为头部间隙的路径片段
+// 				data[0:oneRange.Start],
+// 				Key{},
+// 				int64(rangeReadCount*rangeRation),
+// 				int64(rangeWriteCount*rangeRation),
+// 			)
+// 			children = append(children, frontChild)
+// 			splitKeys = append(splitKeys, childPathSegment)
+// 		}
+
+// 		// 加入目前区域的子节点
+// 		rangeRation = float64(oneRange.End-oneRange.Start) / ReservoirCap // 自动转型
+// 		childRangeEnd := NextKeySameLength(childPathSegment)              // 将前缀+1设置为结尾
+// 		// 构造子节点
+// 		child := newHeatNode(
+// 			nextLevel,
+// 			childPathSegment,                  // 设置当前区间的共有前缀为开始
+// 			childRangeEnd,                     // 设置当前区间的共有前缀+1为结束
+// 			childPathSegment,                  // 设置上路径片段
+// 			data[oneRange.Start:oneRange.End], // 传递当前区间的Key
+// 			oneRange.CommonPrefix,             // 用于剔除当前区间共有前缀
+// 			int64(rangeReadCount*rangeRation),
+// 			int64(rangeWriteCount*rangeRation),
+// 		)
+// 		children = append(children, child)
+// 		splitKeys = append(splitKeys, childRangeEnd)
+// 		var afterChildRangeEnd Key // 尾部间隙在Key值范围上结束的值
+// 		var afterChildIndexEnd int // 尾部间隙在蓄水池上结束的索引
+// 		if i == len(PrefixGroups)-1 {
+// 			// 如果是最后一个区间
+// 			afterChildRangeEnd = node.RangeEnd
+// 			afterChildIndexEnd = ReservoirCap
+// 		} else {
+// 			// 如果是普通的区间之间间隙
+// 			afterChildRangeEnd = MergeKey(node.PathSegment, PrefixGroups[i+1].CommonPrefix)
+// 			afterChildIndexEnd = PrefixGroups[i+1].Start
+// 		}
+
+// 		// 如果当前区间的尾部和间隙的尾部相同，那么就不用加间隙了！
+// 		if CompareKey(afterChildRangeEnd, childRangeEnd) != 0 {
+// 			// 加尾部间隙
+// 			rangeRation = float64(afterChildIndexEnd-oneRange.End) / ReservoirCap
+// 			afterChild := newHeatNode(
+// 				nextLevel,
+// 				childRangeEnd,      // 将当前区间的尾部设置为间隙的开始
+// 				afterChildRangeEnd, // 将下一区间(或者父亲的尾)的头部设置为间隙的结束
+// 				node.PathSegment,   // 设置父节点的路径片段为尾部间隙的路径片段
+// 				data[oneRange.End:afterChildIndexEnd],
+// 				Key{},
+// 				int64(rangeReadCount*rangeRation),
+// 				int64(rangeWriteCount*rangeRation),
+// 			)
+// 			children = append(children, afterChild)
+// 			if i != len(PrefixGroups)-1 { // 不是最后一个区间，才需要加分裂点
+// 				splitKeys = append(splitKeys, afterChildRangeEnd)
+// 			}
+// 		}
+// 	}
+
+// 	return children, splitKeys
+// }
