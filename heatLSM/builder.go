@@ -186,7 +186,8 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool) {
 	}
 
 	// 判断是否满足分裂条件，写'&&'性能更高(不需要比较所有即可得出结果)
-	if n.ReadCount > n.SplitThreshold && n.WriteCount > 0 && n.ReadCount/n.WriteCount > TargetRatio && len(n.SuffixReservoir) == ReservoirCap {
+	if n.ReadCount > n.SplitThreshold && len(n.SuffixReservoir) == ReservoirCap {
+		// if n.ReadCount > n.SplitThreshold && n.WriteCount > 0 && n.ReadCount/n.WriteCount > TargetRatio && len(n.SuffixReservoir) == ReservoirCap {
 		// 当前范围符合标准，允许分裂
 		// TODO:将当前范围添加到某个地方记录起来
 		n.Evolve() // NOTE:核心操作，进行分裂
@@ -196,8 +197,9 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool) {
 // Evolve 是核心分裂方法，通常由后台 Worker 调用，或者在 Write 路径中异步触发
 // NOTE:调用前请确保n满足分裂的条件！！
 func (n *HeatNode) Evolve() {
-	n.Lock() // 加写锁
-	defer n.Unlock()
+	// NOTE:因为这个函数目前是调用在AddSample，而该函数就已经加了写锁了，这里先不加了
+	// n.Lock() // 加写锁
+	// defer n.Unlock()
 
 	// 先对蓄水池中的Key后缀进行排序
 	sort.Slice(n.SuffixReservoir, func(i, j int) bool {
@@ -252,9 +254,15 @@ func (node *HeatNode) splitReservoir(data []Key, PrefixGroups []ResIndexRange) (
 			// 现在需要加头部间隙
 			// frontRS :=
 			rangeRation = float64(oneRange.Start) / float64(ReservoirCap)
+			frontRangeStart := Key{} // 如果父节点有公共前缀，那么父节点的起始节点就应该等于公共前缀，所以下一层头部间隙就应该为空
+			if len(node.PathSegment) == 0 {
+				// 如果父节点无公共前缀，那么下一层头部间隙就应该等于父节点的开始
+				frontRangeStart = node.RangeStart
+			}
+
 			frontChild := newHeatNode(
 				nextLevel,
-				node.RangeStart,       // 设置父节点的开始为第一个孩子的开始
+				frontRangeStart,       // 设置父节点的开始为第一个孩子的开始
 				oneRange.CommonPrefix, // 设置第一个区间的start（即区间的公共前缀）为第一个孩子的结尾
 				Key{},                 // 空隙节点无公共前缀
 				data[0:oneRange.Start],
@@ -284,8 +292,12 @@ func (node *HeatNode) splitReservoir(data []Key, PrefixGroups []ResIndexRange) (
 		var afterChildIndexEnd int // 尾部间隙在蓄水池上结束的索引
 		if i == len(PrefixGroups)-1 {
 			// 如果是最后一个区间
-			afterChildRangeEnd = node.RangeEnd
 			afterChildIndexEnd = ReservoirCap
+			afterChildRangeEnd = Key{} // NOTE:如果父节点有公共前缀，那么子节点的尾部间隙同头部间隙一样，均设值为空！！
+			if len(node.PathSegment) == 0 {
+				// 如果父节点无公共前缀，那么下一层尾部间隙就应该等于父节点的结尾
+				afterChildRangeEnd = node.RangeEnd
+			}
 		} else {
 			// 如果是普通的区间之间间隙
 			afterChildRangeEnd = PrefixGroups[i+1].CommonPrefix
@@ -338,18 +350,18 @@ func (n *HeatNode) SearchLeaf(key Key, isRead bool) *HeatNode {
 			return nil
 		}
 
-		// 3. 如果是叶子节点，这就是我们要找的目标
-		if current.IsLeaf {
-			current.RUnlock()
-			current.AddSample(searchSuffix, isRead) // NOTE:核心操作，尝试追加样本
-			return current
-		}
-
-		// 4. 剥离前缀，准备下一层的路由
+		// 3. 剥离前缀，准备下一层的路由
 		// 下一层子节点的 SplitKey 是相对于当前节点 PathSegment 之后的后缀
 		prefixLen := len(current.PathSegment)
 		// 此时 searchSuffix 长度一定 >= prefixLen，因为前面 HasPrefix 检查过了
 		remainingKey := searchSuffix[prefixLen:]
+
+		// 4. 如果是叶子节点，这就是我们要找的目标
+		if current.IsLeaf {
+			current.RUnlock()
+			current.AddSample(remainingKey, isRead) // NOTE:核心操作，尝试追加样本
+			return current
+		}
 
 		// 5. 二分查找确定子节点索引
 		// SplitRangeKey 存储的是分割点（子节点的上界，左闭右开原则）

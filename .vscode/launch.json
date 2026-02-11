@@ -13,5 +13,18 @@
       "args": [],
       "showLog": true
     },
+    {
+        "name": "testHeatLsm", 
+        "type": "go",
+        "request": "launch",
+        "mode": "test", 
+        "program": "${workspaceRoot}/heatLSM", // 测试的包路径（${fileDirname} 表示当前打开文件的文件夹，可手动替换为绝对路径）
+        "args": [
+            "-test.run",
+            "TestHeatNode_Evolve_Integration", // 传递 go test 参数：-run 指定测试函数（精准匹配 TestLDBCQueries）
+        ],
+        "cwd": "${workspaceRoot}/heatLSM", // 关键：指定执行 go test 的文件夹（替换为你的目标文件夹绝对路径）
+        "console": "integratedTerminal"
+    },
   ]
 }
