@@ -460,6 +460,9 @@ func (txn *Txn) Delete(key []byte) error {
 
 // Get looks for key and returns corresponding Item.
 // If key is not found, ErrKeyNotFound is returned.
+// 获取键并返回对应的 Item。
+// 如果未找到键，则返回ErrKeyNotFound。
+// NOTE:YCSB的读取目前用的这个函数
 func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	if len(key) == 0 {
 		return nil, ErrEmptyKey

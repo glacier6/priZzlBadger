@@ -52,8 +52,8 @@ type Options struct {
 
 	// Fine tuning options.
 
-	MemTableSize        int64
-	BaseTableSize       int64
+	MemTableSize        int64 // Memtable大小，默认64MB
+	BaseTableSize       int64 // SST目标文件大小，默认2MB（各层不一样，注意L0层的SST目标大小为Mem大小，即64MB！）
 	BaseLevelSize       int64
 	LevelSizeMultiplier int
 	TableSizeMultiplier int
@@ -65,9 +65,9 @@ type Options struct {
 	// Changing BlockSize across DB runs will not break badger. The block size is
 	// read from the block index stored at the end of the table.
 	// 在数据库运行中更改BlockSize不会破坏badger。块大小从存储在表末尾的块索引中读取。
-	BlockSize          int // 单个块缓存大小
+	BlockSize          int // 单个块大小，默认4KB（与OS的页大小一致），需要注意的是，BlockSize 并不是一个严格的硬切分限制，而是一个 “构建时的目标阈值”，即实际的块大小通常会 稍微大于 4KB（因为必须包含完整的一条 KV 记录，不能在记录中间切断）。
 	BloomFalsePositive float64
-	BlockCacheSize     int64 // 总块缓存大小
+	BlockCacheSize     int64 // 总块缓存大小，默认256MB
 	IndexCacheSize     int64
 
 	NumLevelZeroTables      int
@@ -134,8 +134,8 @@ func DefaultOptions(path string) Options {
 		Dir:      path, //LSM树的存储地址
 		ValueDir: path, //Vlog存储地址
 
-		MemTableSize:        64 << 20, //内存表的总尺寸大小 64乘2的20次方（向左移位20次）
-		BaseTableSize:       2 << 20,  //SST大小
+		MemTableSize:        64 << 20, //内存表的总尺寸大小 64乘2的20次方（向左移位20次），64MB
+		BaseTableSize:       2 << 20,  //SST大小，2MB
 		BaseLevelSize:       10 << 20,
 		TableSizeMultiplier: 2,
 		LevelSizeMultiplier: 10, //层间比例
@@ -146,15 +146,15 @@ func DefaultOptions(path string) Options {
 		NumCompactors:           4, // Run at least 2 compactors. Zero-th compactor prioritizes L0.
 		NumLevelZeroTables:      5,
 		NumLevelZeroTablesStall: 15,
-		NumMemtables:            5,    //内存表数量
-		BloomFalsePositive:      0.01, //布隆过滤区假阳性的比例
-		BlockSize:               4 * 1024,
-		SyncWrites:              false, //是否同步磁盘的写入
+		NumMemtables:            5,        //内存表数量
+		BloomFalsePositive:      0.01,     //布隆过滤区假阳性的比例
+		BlockSize:               4 * 1024, // 4KB，与操作系统的缺页中断的4KB相等！！
+		SyncWrites:              false,    //是否同步磁盘的写入
 		NumVersionsToKeep:       1,
 		CompactL0OnClose:        false,
 		VerifyValueChecksum:     false, //是否进行参数校验和的检查
 		Compression:             options.Snappy,
-		BlockCacheSize:          256 << 20, //块缓存尺寸
+		BlockCacheSize:          256 << 20, //块缓存尺寸，256MB！
 		IndexCacheSize:          0,         //索引缓存尺寸
 
 		// The following benchmarks were done on a 4 KB block size (default block size). The
