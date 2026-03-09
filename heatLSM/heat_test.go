@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"testing"
 	"time"
+
+	"github.com/valyala/fastrand"
 )
 
 // 辅助函数：生成测试 Key
@@ -21,7 +23,7 @@ func generateKey(prefix string, length int) Key {
 
 // 辅助函数：深度优先遍历打印树结构
 func printTree(node *HeatNode, prefix string) {
-	fmt.Printf("%sLvl:%d Path:[%s] Range:[%s-%s) Leaf:%v Read:%d Sample:%d\n",
+	fmt.Printf("%sLvl:%d Path:[%s] Range:[%s-%s) Leaf:%v Read:%d Write:%d Sample:%d\n",
 		prefix,
 		node.Level,
 		string(node.PathSegment),
@@ -29,7 +31,8 @@ func printTree(node *HeatNode, prefix string) {
 		string(node.RangeEnd),
 		node.IsLeaf,
 		node.ReadCount,
-		len(node.SuffixReservoir),
+		node.WriteCount,
+		len(node.RSuffixReservoir),
 	)
 	for i, child := range node.Children {
 		printTree(child, prefix+"  ")
@@ -45,7 +48,7 @@ func TestHeatNode_Evolve_Integration(t *testing.T) {
 	// 1. 初始化根节点
 	// Level 0, 初始 SplitThreshold 设小一点以便容易触发分裂
 	// 注意：代码中 SplitThreshold 是 1<<(Level+10)，即 1024。我们需要插入足够多的数据。
-	root := newHeatNode(0, Key{}, Key(nil), Key{}, []Key{}, 0, 0)
+	root := newHeatNode(0, Key{}, Key(nil), Key{}, []Key{}, []Key{}, 0, 0)
 
 	// 为了测试方便，我们可以临时调低 SplitThreshold 或者插入大量数据
 	// 这里我们通过 mock 的方式修改 SplitThreshold，或者直接插入 > 1024 次读取
@@ -56,17 +59,23 @@ func TestHeatNode_Evolve_Integration(t *testing.T) {
 	// 这样分裂时应该能识别出 "a", "b", "c" 或者更长的前缀
 	prefixes := []string{"apple", "banana", "cherry", "date"}
 
-	totalOps := 100000 // 足够触发分裂 (Threshold=1024)
-
+	totalOps := 1000000 // 足够触发分裂 (Threshold=1024)
+	var leaf *HeatNode
 	fmt.Println("--- Phase 1: Injecting Data ---")
 	for i := 0; i < totalOps; i++ {
 		// 随机选择一个前缀
 		p := prefixes[rand.Intn(len(prefixes))]
 		key := generateKey(p, 10) // 长度10的key
 
-		// 模拟读取操作 (isRead = true)
+		// 模拟读取写入操作 (isRead = true)
+		if fastrand.Uint32n(3) == 0 {
+			// 写入
+			leaf = root.SearchLeaf(key, false)
+		} else {
+			// 读取
+			leaf = root.SearchLeaf(key, true)
+		}
 
-		leaf := root.SearchLeaf(key, true)
 		if leaf == nil {
 			t.Fatalf("SearchLeaf returned nil for key: %s", key)
 		}
@@ -91,7 +100,7 @@ func TestHeatNode_Evolve_Integration(t *testing.T) {
 
 	for _, ks := range testKeys {
 		k := Key(ks)
-		leaf := root.SearchLeaf(k, true)
+		leaf = root.SearchLeaf(k, true)
 		if leaf == nil {
 			t.Errorf("Failed to find leaf for key: %s", k)
 			continue

@@ -115,6 +115,38 @@ func FindTopNPrefixGroups(keys []Key, n int) []ResIndexRange {
 	return groups
 }
 
+// CalculateRangeRatio 计算区间 [lastSplitKey（下标为lastSplitIndex）, currentSplitKey) 在写入蓄水池中占据的比例
+// 注意：传入的 reservoir 必须是已经按字典序排序过的！
+// 返回值：[0.0, 1.0] 之间的浮点数
+func CalculateRangeRatio(lastSplitIndex int, currentSplitKey Key, reservoir []Key) (float64, int) {
+	totalLen := len(reservoir)
+
+	// 防御性检查：如果蓄水池为空（比如极其罕见的纯读/纯写极端情况导致的空池），直接返回 0
+	if totalLen == 0 {
+		return 0.0, 0
+	}
+
+	// 2. 寻找结束点 endIndex (第一个 >= currentSplitKey 的元素位置)
+	endIndex := totalLen
+	if len(currentSplitKey) > 0 { // 如果 currentSplitKey 为空或 nil，说明是绝对尾部，直接取 totalLen
+		endIndex = sort.Search(totalLen, func(i int) bool {
+			return bytes.Compare(reservoir[i], currentSplitKey) >= 0
+		})
+	}
+
+	// 防御性检查：如果区间非法（比如传参反了），返回 0
+	if lastSplitIndex > endIndex {
+		return 0.0, endIndex
+	}
+
+	// 3. 计算区间内元素个数并求比例
+	// 因为 endIndex 是第一个 >= currentSplitKey 的元素，而区间是左闭右开，
+	// 所以区间内的元素正好是 reservoir[startIndex:endIndex]，个数就是 endIndex - startIndex
+	count := endIndex - lastSplitIndex
+
+	return float64(count) / float64(totalLen), endIndex
+}
+
 func MergeKey(k1, k2 Key) Key {
 	// 1. 预分配：一次性申请好所有需要的内存
 	// len=0, cap=len(k1)+len(k2)
