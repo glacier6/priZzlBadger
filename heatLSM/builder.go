@@ -1,7 +1,9 @@
-package heatlsm
+package heatLSM
 
 // NOTE:所有范围遵循左闭右开原则
 // 如 [A,C) [C,G) [G,Z)   其中的分裂点SplitRangeKey是C，G
+
+// YCSB用的BadgerDB的读位置NOTE:2026031800 写位置NOTE:2026031801
 import (
 	"bytes"
 	"fmt"
@@ -121,7 +123,7 @@ func newHeatNode(Level int64, start, end Key, pathSeg Key, iniRReservoir []Key, 
 	return n
 }
 
-// 初始化管理器
+// 初始化管理器 初始位置在NOTE:2026031802
 func NewHeatmapManager() *HeatmapManager {
 	// 定义全域范围：空字节到 nil (无穷大)
 	// 初始 PathSegment 为空，因为还没有公共前缀
@@ -134,12 +136,12 @@ func NewHeatmapManager() *HeatmapManager {
 
 	// 2. 初始化子树
 	// 子树初始结构必须与母树一致（完全同构）
-	childRoot := newHeatNode(0, rootStart, rootEnd, Key{}, []Key{}, []Key{}, 0, 0)
-	child := &HeatmapTree{Root: childRoot}
+	// childRoot := newHeatNode(0, rootStart, rootEnd, Key{}, []Key{}, []Key{}, 0, 0)
+	// child := &HeatmapTree{Root: childRoot}
 
 	return &HeatmapManager{
 		MotherTree: mother,
-		ChildTree:  child,
+		// ChildTree:  child,
 		TotalRead:  0,
 		TotalWrite: 0,
 	}
@@ -449,4 +451,45 @@ func (n *HeatNode) SearchLeaf(key Key, isRead bool) *HeatNode {
 		current = nextChild
 		searchSuffix = remainingKey
 	}
+}
+
+// CalculateTreeMemory 递归计算整棵树的近似内存占用（单位：字节）
+func (n *HeatNode) CalculateTreeMemory() int64 {
+	if n == nil {
+		return 0
+	}
+
+	// 1. 结构体本身的基础大小 (64位机器下，指针、int64、切片头等加起来大概 150 字节左右)
+	var size int64 = 150
+
+	// 2. 累加 PathSegment 和边界 Key 的底层字节大小
+	size += int64(len(n.PathSegment))
+	size += int64(len(n.RangeStart))
+	size += int64(len(n.RangeEnd))
+
+	// 3. 累加 SplitRangeKey 数组的大小
+	// 切片本身有一定的容量开销，加上每个 []byte 内部的真实长度
+	size += int64(cap(n.SplitRangeKey) * 24) // 切片头开销
+	for _, key := range n.SplitRangeKey {
+		size += int64(len(key))
+	}
+
+	// 4. 累加读写蓄水池的内存占用 (这是内存大头)
+	size += int64(cap(n.RSuffixReservoir) * 24)
+	for _, key := range n.RSuffixReservoir {
+		size += int64(len(key))
+	}
+
+	size += int64(cap(n.WSuffixReservoir) * 24)
+	for _, key := range n.WSuffixReservoir {
+		size += int64(len(key))
+	}
+
+	// 5. 递归计算所有子节点的内存
+	size += int64(cap(n.Children) * 8) // 子节点指针数组的开销
+	for _, child := range n.Children {
+		size += child.CalculateTreeMemory()
+	}
+
+	return size
 }

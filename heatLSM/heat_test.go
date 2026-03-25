@@ -1,4 +1,4 @@
-package heatlsm
+package heatLSM
 
 import (
 	"fmt"
@@ -19,27 +19,6 @@ func generateKey(prefix string, length int) Key {
 		k[i] = byte(rand.Intn(26) + 'a')
 	}
 	return k
-}
-
-// 辅助函数：深度优先遍历打印树结构
-func printTree(node *HeatNode, prefix string) {
-	fmt.Printf("%sLvl:%d Path:[%s] Range:[%s-%s) Leaf:%v Read:%d Write:%d Sample:%d\n",
-		prefix,
-		node.Level,
-		string(node.PathSegment),
-		string(node.RangeStart),
-		string(node.RangeEnd),
-		node.IsLeaf,
-		node.ReadCount,
-		node.WriteCount,
-		len(node.RSuffixReservoir),
-	)
-	for i, child := range node.Children {
-		printTree(child, prefix+"  ")
-		if i < len(node.SplitRangeKey) {
-			fmt.Printf("%s  [Split: %s]\n", prefix, string(node.SplitRangeKey[i]))
-		}
-	}
 }
 
 func TestHeatNode_Evolve_Integration(t *testing.T) {
@@ -91,7 +70,7 @@ func TestHeatNode_Evolve_Integration(t *testing.T) {
 	}
 
 	// 打印树结构进行人工检查
-	printTree(root, "")
+	PrintTree(root, "")
 
 	// 3. 验证路由正确性
 	// 分裂后，我们再次查找之前的 Key，应该能找到正确的叶子节点，且 PathSegment 匹配

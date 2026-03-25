@@ -1,7 +1,8 @@
-package heatlsm
+package heatLSM
 
 import (
 	"bytes"
+	"fmt"
 	"sort"
 )
 
@@ -167,6 +168,27 @@ func MergeKey(k1, k2 Key) Key {
 //	+1 : a > b
 func CompareKey(a, b Key) int {
 	return bytes.Compare(a, b)
+}
+
+// 辅助函数：深度优先遍历打印树结构
+func PrintTree(node *HeatNode, prefix string) {
+	fmt.Printf("%sLvl:%d Path:[%s] Range:[%s-%s) Leaf:%v Read:%d Write:%d Sample:%d\n",
+		prefix,
+		node.Level,
+		string(node.PathSegment),
+		string(node.RangeStart),
+		string(node.RangeEnd),
+		node.IsLeaf,
+		node.ReadCount,
+		node.WriteCount,
+		len(node.RSuffixReservoir),
+	)
+	for i, child := range node.Children {
+		PrintTree(child, prefix+"  ")
+		if i < len(node.SplitRangeKey) {
+			fmt.Printf("%s  [Split: %s]\n", prefix, string(node.SplitRangeKey[i]))
+		}
+	}
 }
 
 // NextKeySameLength 返回在字典序上比输入 key 大 1 的 Key。

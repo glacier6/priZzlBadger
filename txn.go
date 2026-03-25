@@ -421,7 +421,11 @@ func (txn *Txn) modify(e *Entry) error {
 //
 // The current transaction keeps a reference to the key and val byte slice
 // arguments. Users must not modify key and val until the end of the transaction.
+// NOTE:2026031801
 func (txn *Txn) Set(key, val []byte) error {
+	// zzlHACK:记录写
+	go txn.db.zzlHeatmap.MotherTree.Root.SearchLeaf(key, false)
+	// zzlHACK:END
 	return txn.SetEntry(NewEntry(key, val))
 }
 
@@ -462,8 +466,12 @@ func (txn *Txn) Delete(key []byte) error {
 // If key is not found, ErrKeyNotFound is returned.
 // 获取键并返回对应的 Item。
 // 如果未找到键，则返回ErrKeyNotFound。
-// NOTE:YCSB的读取目前用的这个函数
+// NOTE:2026031800 YCSB的读取目前用的这个函数
 func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
+	// zzlHACK:记录读
+	go txn.db.zzlHeatmap.MotherTree.Root.SearchLeaf(key, true)
+	// return
+	// zzlHACK:END
 	if len(key) == 0 {
 		return nil, ErrEmptyKey
 	} else if txn.discarded {

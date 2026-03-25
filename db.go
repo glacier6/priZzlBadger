@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: © Hypermode Inc. <hello@hypermode.com>
  * SPDX-License-Identifier: Apache-2.0
  */
+//  github.com/dgraph-io/badger/v4
 
 package badger
 
@@ -25,6 +26,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/dgraph-io/badger/v4/fb"
+	"github.com/dgraph-io/badger/v4/heatLSM"
 	"github.com/dgraph-io/badger/v4/options"
 	"github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/badger/v4/skl"
@@ -117,6 +119,7 @@ type DB struct {
 	blockCache *ristretto.Cache[[]byte, *table.Block]   //块缓存
 	indexCache *ristretto.Cache[uint64, *fb.TableIndex] // 索引缓存
 	allocPool  *z.AllocatorPool
+	zzlHeatmap *heatLSM.HeatmapManager
 }
 
 const (
@@ -248,7 +251,8 @@ func Open(opt Options) (*DB, error) {
 		pub:              newPublisher(),
 		allocPool:        z.NewAllocatorPool(8),
 		bannedNamespaces: &lockedKeys{keys: make(map[uint64]struct{})},
-		threshold:        initVlogThreshold(&opt), // 初始化大小KV对的分界线等类似值
+		threshold:        initVlogThreshold(&opt),     // 初始化大小KV对的分界线等类似值
+		zzlHeatmap:       heatLSM.NewHeatmapManager(), // zzlHACK:NOTE:2026031802
 	}
 
 	db.syncChan = opt.syncChan // 这个只用于测试
@@ -537,6 +541,13 @@ func (db *DB) Close() error {
 	db.closeOnce.Do(func() {
 		err = db.close()
 	})
+	// zzlHACK:
+	defer func() {
+		heatLSM.PrintTree(db.zzlHeatmap.MotherTree.Root, "")
+		memBytes := db.zzlHeatmap.MotherTree.Root.CalculateTreeMemory()
+		fmt.Printf("🔥 热力树总内存占用: %.2f MB\n", float64(memBytes)/(1024*1024))
+	}()
+	// zzlHACK:END
 	return err
 }
 
