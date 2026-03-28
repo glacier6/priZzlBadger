@@ -46,7 +46,7 @@ type HeatNode struct {
 
 	// --- 结构控制 ---
 	IsLeaf        bool
-	Children      []*HeatNode // 这里使用有序切片存储子节点，分裂不固定为2,可为N个
+	Children      []*HeatNode // 这里使用有序切片存储子节点，分裂不固定为2,可为N个  TODO:这个Children和下面的SplitRangeKey的长度大小是否要直接固定,这样的话虽然空间变大,但是因为空间是连续的了,所以cpu cache会命中率很高
 	SplitRangeKey []Key       // 分裂点列表，即Children中前【len(Children)-1】个的RangeEnd值（注意存的是逐层拼接的增量Key）
 
 	// --- 进化基因 (仅叶子节点有效) ---
@@ -430,7 +430,7 @@ func (n *HeatNode) SearchLeaf(key Key, isRead bool) *HeatNode {
 		// SplitRangeKey 存储的是分割点（子节点的上界，左闭右开原则）
 		// 我们需要找到第一个 SplitKey > remainingKey 的位置 index
 		// 这样 remainingKey 就属于 Children[index]
-		idx := sort.Search(len(current.SplitRangeKey), func(i int) bool {
+		idx := sort.Search(len(current.SplitRangeKey), func(i int) bool { // TODO:二分查找是if/else,而SplitRangeKey很小,是否需要顺序遍历以提速CPU
 			// 比较：SplitKey > remainingKey
 			return bytes.Compare(current.SplitRangeKey[i], remainingKey) > 0
 		})

@@ -425,6 +425,7 @@ func (txn *Txn) modify(e *Entry) error {
 func (txn *Txn) Set(key, val []byte) error {
 	// zzlHACK:记录写
 	go txn.db.zzlHeatmap.MotherTree.Root.SearchLeaf(key, false)
+	go txn.db.zzlTracker.RecordWrite(key)
 	// zzlHACK:END
 	return txn.SetEntry(NewEntry(key, val))
 }
@@ -470,6 +471,7 @@ func (txn *Txn) Delete(key []byte) error {
 func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	// zzlHACK:记录读
 	go txn.db.zzlHeatmap.MotherTree.Root.SearchLeaf(key, true)
+	go txn.db.zzlTracker.RecordRead(key)
 	// return
 	// zzlHACK:END
 	if len(key) == 0 {
