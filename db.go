@@ -545,9 +545,7 @@ func (db *DB) Close() error {
 	})
 	// zzlHACK:
 	defer func() {
-		heatLSM.PrintTree(db.zzlHeatmap.MotherTree.Root, "")
-		memBytes := db.zzlHeatmap.MotherTree.Root.CalculateTreeMemory()
-		fmt.Printf("🔥 热力树总内存占用: %.2f MB\n", float64(memBytes)/(1024*1024))
+		db.zzlHeatmap.Print()
 		db.zzlTracker.PrintTopK(100)
 	}()
 	// zzlHACK:END

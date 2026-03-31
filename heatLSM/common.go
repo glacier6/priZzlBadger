@@ -20,6 +20,20 @@ func commonPrefixLen(a, b Key) int {
 	return n
 }
 
+// FormatBytes 将字节数转换为人类可读的格式 (KB, MB, GB)
+func FormatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
 // 辅助函数：计算一组 Key 的最长公共前缀
 // keys 必须非空
 func calcCommonPrefix(keys []Key) Key {
@@ -171,7 +185,24 @@ func CompareKey(a, b Key) int {
 }
 
 // 辅助函数：深度优先遍历打印树结构
-func PrintTree(node *HeatNode, prefix string) {
+// 【重构】：增加 m *HeatmapManager 参数，用于通过 StatsID 寻址真实数据
+func PrintTree(node *HeatNode, prefix string, m *HeatmapManager) {
+	if node == nil {
+		return
+	}
+
+	var readCount, writeCount int64
+	var sampleCount int
+
+	// 如果 StatsID 不为 -1，说明它有绑定的物理统计数据（通常是叶子节点）
+	if node.StatsID != -1 {
+		// O(1) 极速去底层内存池捞数据
+		stats := m.getStats(node.StatsID)
+		readCount = stats.ReadCount
+		writeCount = stats.WriteCount
+		sampleCount = len(stats.RSuffixReservoir)
+	}
+
 	fmt.Printf("%sLvl:%d Path:[%s] Range:[%s-%s) Leaf:%v Read:%d Write:%d Sample:%d\n",
 		prefix,
 		node.Level,
@@ -179,12 +210,14 @@ func PrintTree(node *HeatNode, prefix string) {
 		string(node.RangeStart),
 		string(node.RangeEnd),
 		node.IsLeaf,
-		node.ReadCount,
-		node.WriteCount,
-		len(node.RSuffixReservoir),
+		readCount,   // 从 Manager 捞出来的读计数
+		writeCount,  // 从 Manager 捞出来的写计数
+		sampleCount, // 从 Manager 捞出来的蓄水池大小
 	)
+
 	for i, child := range node.Children {
-		PrintTree(child, prefix+"  ")
+		// 递归调用时，记得把 Manager 继续传下去
+		PrintTree(child, prefix+"  ", m)
 		if i < len(node.SplitRangeKey) {
 			fmt.Printf("%s  [Split: %s]\n", prefix, string(node.SplitRangeKey[i]))
 		}
