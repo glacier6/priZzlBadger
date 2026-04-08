@@ -544,10 +544,10 @@ func (db *DB) Close() error {
 		err = db.close()
 	})
 	// zzlHACK:
-	defer func() {
-		db.zzlHeatmap.Print()
-		db.zzlTracker.PrintTopK(100)
-	}()
+	// defer func() {
+	// 	db.zzlHeatmap.Print()
+	// 	db.zzlTracker.PrintTopK(100)
+	// }()
 	// zzlHACK:END
 	return err
 }
@@ -840,7 +840,7 @@ func (db *DB) writeToLSM(b *request) error {
 		return errors.Errorf("Ptrs and Entries don't match: %+v", b)
 	}
 
-	for i, entry := range b.Entries { //遍历当前请求的kv数组
+	for i, entry := range b.Entries { //遍历当前请求新增的kv数组
 		var err error
 		if entry.skipVlogAndSetThreshold(db.valueThreshold()) { // db.valueThreshold()获取的是分大小KV的界限，貌似默认是1024字节
 			// 当前kv是小value，把值放进memtable

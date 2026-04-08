@@ -1322,7 +1322,7 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 	if len(cd.dropPrefixes) > 0 {
 		// Use all tables if drop prefix is set. We don't want to compact only a
 		// sub-range. We want to compact all the tables.
-		// 如果设置了删除前缀，则使用所有表。我们不想只压缩一个子范围。我们想压缩所有的table。
+		// 如果设置了删除前缀，则使用所有表。此时,我们不想只压缩一个子范围。我们想压缩所有的table。
 		out = top
 	} else {
 		var kr keyRange
@@ -1330,7 +1330,7 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 		// cd.top[0]是最旧的文件。所以我们先从最旧的文件开始。
 		// 注意下面这个循环貌似并不是能严格的完全的计算出来L0层哪些SST区间是重叠的
 		// 因为比如如果第一个与第二个SST不重叠，第二个SST的范围信息就会丢失 （NOTE:注意，这里依旧进行的不是一个层完整的范围，只是压缩一个子范围，上面那个if才会压缩L0所有的TABLE）
-		// 所以，下面这个if找到的是与top[0]重叠或间接重叠的所有SST，是一个子范围
+		// 所以，下面这个if找到的是与top[0]重叠或间接重叠的所有在切片中挨着的SST，是一个子范围
 		for _, t := range top { //计算L0层哪些SST区间是重叠的
 			dkr := getKeyRange(t)     //得到当前SST的区间范围
 			if kr.overlapsWith(dkr) { //判断累计范围kr与当前SST范围dkr是否重叠（注意如果累计范围kr为空，那就默认是重叠的）
@@ -1726,6 +1726,30 @@ func (s *levelsController) doCompact(id int, p compactionPriority) error {
 		}
 	}
 	defer s.cstatus.delete(cd) // Remove the ranges from compaction status.
+
+	// zzlHACK:
+	// ========================================================
+	// 🚀 [自定义探针]：提取并打印本次 Compaction 详情
+	// ========================================================
+	// var topRanges, botRanges []string
+
+	// // 遍历并收集高层每个 SST 的范围
+	// for _, t := range cd.top {
+	// 	// 注意：Badger 源码中 table.Table 获取最大最小 Key 的方法通常是 Smallest() 和 Biggest()
+	// 	topRanges = append(topRanges, fmt.Sprintf("[%s TO %s]", t.Smallest(), t.Biggest()))
+	// }
+
+	// // 遍历并收集底层每个 SST 的范围
+	// for _, t := range cd.bot {
+	// 	botRanges = append(botRanges, fmt.Sprintf("[%s TO %s]", t.Smallest(), t.Biggest()))
+	// }
+
+	// // 为了终端显示清晰，这里做了换行处理
+	// fmt.Printf("[zzlCompactor: %d] 🔥执行压缩 | L%d -> L%d\n  --> Top源SST (%d个): %v\n  --> Bot受害者SST (%d个): %v\n",
+	// 	id, cd.thisLevel.level, cd.nextLevel.level,
+	// 	len(cd.top), topRanges,
+	// 	len(cd.bot), botRanges)
+	// zzlHACK:END
 
 	span.Annotatef(nil, "Compaction: %+v", cd)
 	if err := s.runCompactDef(id, l, cd); err != nil { // NOTE:核心操作，真正开始执行压缩的函数（注意一次cd合并任务只对应一个当前层的某个SST(或多个)，而不是对应一整个层）

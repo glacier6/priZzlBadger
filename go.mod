@@ -1,8 +1,8 @@
 module github.com/dgraph-io/badger/v4
 
-go 1.22.12
+go 1.23
 
-toolchain go1.24.0
+toolchain go1.24.2
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -21,10 +21,13 @@ require (
 )
 
 require (
+	github.com/axiomhq/hyperloglog v0.2.6 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/dgryski/go-metro v0.0.0-20250106013310-edb8663e5e33 // indirect
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/kamstrup/intmap v0.5.2 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1 // indirect

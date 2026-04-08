@@ -472,7 +472,6 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	// zzlHACK:记录读
 	txn.db.zzlHeatmap.MotherTree.Root.SearchLeaf(key, true, txn.db.zzlHeatmap)
 	// go txn.db.zzlTracker.RecordRead(key)
-	// return
 	// zzlHACK:END
 	if len(key) == 0 {
 		return nil, ErrEmptyKey

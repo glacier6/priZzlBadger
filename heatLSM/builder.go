@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/axiomhq/hyperloglog"
 	"github.com/valyala/fastrand"
 )
 
@@ -33,9 +34,16 @@ type Key []byte
 // --- 【新增】：肉体（集中存储的统计数据） ---
 // 这部分数据将被紧凑地存放在 HeatmapManager 的二维分块数组里
 type RegionStats struct {
-	IsActive         bool // 标记该槽位是否在使用中，方便复用
-	ReadCount        int64
-	WriteCount       int64
+	IsActive bool // 标记该槽位是否在使用中，方便复用
+
+	ReadCount  int64 // 读写计数用int类型,这样在cpu内只需要执行一次自增即可,花费时间最少
+	WriteCount int64
+
+	OverwriteRation float64 // 覆写率,NOTE:注意覆写率不能直接实时计算,所以这里的OverwriteRation实际是上一轮周期结束时的 本轮周期覆写率和上轮覆写率的权重合
+	// inheritOverwriteRation float64             // 从父节点或者上一轮周期继承的覆写率
+	EpochStartWrite int64               // 本轮周期的开始时的写入量,WriteCount - EpochStartWrite等于当前周期的写入量
+	CurrentHLL      *hyperloglog.Sketch // 用于覆写率
+
 	TotalSamplesSeen int64
 	RSuffixReservoir []Key // 注意这个还有下面这个俩蓄水池在StatsChunks存储的是一个指针,并不是直接在StatsChunks内
 	WSuffixReservoir []Key
@@ -109,6 +117,10 @@ func (m *HeatmapManager) AllocateStats() int32 {
 		stats.IsActive = true
 		stats.ReadCount = 0
 		stats.WriteCount = 0
+		stats.EpochStartWrite = 0
+		stats.CurrentHLL = hyperloglog.New14() // 构造一个新的Sparse HLL
+		stats.OverwriteRation = 0.0            // 默认覆盖率等均为0,如果有遗传,那么外面再覆盖它
+
 		stats.RSuffixReservoir = stats.RSuffixReservoir[:0] // 保留容量，清空数据
 		stats.WSuffixReservoir = stats.WSuffixReservoir[:0]
 		return id
@@ -129,6 +141,8 @@ func (m *HeatmapManager) AllocateStats() int32 {
 
 	m.StatsChunks[chunkIdx] = append(m.StatsChunks[chunkIdx], RegionStats{
 		IsActive:         true,
+		CurrentHLL:       hyperloglog.New14(),
+		OverwriteRation:  0.0,
 		RSuffixReservoir: make([]Key, 0, ReservoirCap),
 		WSuffixReservoir: make([]Key, 0, WReservoirCap),
 	})
@@ -225,6 +239,7 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
 		}
 	} else {
 		stats.WriteCount++
+		stats.CurrentHLL.Insert(keySuffix)               // 喂给HLL,来算覆写率
 		if len(stats.WSuffixReservoir) < WReservoirCap { // 这里修复了你原代码中小 bug，写入应判断 WReservoirCap
 			k := make(Key, len(keySuffix))
 			copy(k, keySuffix)
@@ -301,13 +316,24 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 	nextLevel := node.Level + 1
 	rangeRation := 0.0
 	wRangeRation := 0.0
+	fatherOverwriteRation := 0.0 // 存的是父节点当前的覆写率
 	lastWRangeIndex := 0
 	currentWRangeIndex := 0
 	rangeReadCount := float64(stats.ReadCount)
 	rangeWriteCount := float64(stats.WriteCount)
-	// 遍历选中的区间（每一轮最多可以增加3个子节点【头部间隙节点、当前具有公共前缀的区间节点、尾部间隙节点】）
+	if stats.WriteCount > 0 {
+		uniqueKeys := float64(stats.CurrentHLL.Estimate())
+		fatherCurentOverwriteRation := 1.0 - (uniqueKeys / rangeWriteCount)
+		fatherOverwriteRation = fatherCurentOverwriteRation*0.5 + stats.OverwriteRation*0.5 // 计算出当前父节点的覆写率,TODO:比例需要确定
+		// TODO:如何确定父节点的覆写率,这个和衰退周期有关!需要确定了衰退周期再决定.感觉应该随着每衰退一轮,就计算一次覆写率,计算的同时清空HLL
+		if fatherOverwriteRation < 0 {
+			fatherOverwriteRation = 0
+		}
+	}
+	// 遍历选中的区间（每一轮最多可以增加3个子节点【头部间隙节点(仅第一个元素会加)、当前具有公共前缀的区间节点、尾部间隙节点】）
 	for i, oneRange := range PrefixGroups {
 		if i == 0 {
+			// NOTE:如果是第一个元素,需要加入头部间隙
 			rangeRation = float64(oneRange.Start) / float64(ReservoirCap)
 			wRangeRation, currentWRangeIndex = CalculateRangeRatio(lastWRangeIndex, oneRange.CommonPrefix, WSuffixReservoir)
 			frontRangeStart := Key{} // 如果父节点有公共前缀，那么父节点的起始节点就应该等于公共前缀，所以下一层头部间隙就应该为空
@@ -317,29 +343,33 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 			}
 
 			// 【重构核心】：为新的间隙节点向大内存池申请一块空间
-			childStatsID := m.AllocateStats()
-			childStats := m.getStats(childStatsID)
-			childStats.ReadCount = int64(rangeReadCount * rangeRation)
-			childStats.WriteCount = int64(rangeWriteCount * wRangeRation)
-
+			frontChildStatsID := m.AllocateStats()
+			frontChildStats := m.getStats(frontChildStatsID)
+			frontChildStats.ReadCount = int64(rangeReadCount * rangeRation)
+			frontChildStats.WriteCount = int64(rangeWriteCount * wRangeRation)
+			frontChildStats.EpochStartWrite = frontChildStats.WriteCount
+			if frontChildStats.WriteCount > 0 {
+				frontChildStats.OverwriteRation = fatherOverwriteRation
+			}
 			// 继承并拷贝对应的蓄水池数据 (因为是间隙节点，无公共前缀，不需要剥离)
 			for _, key := range RSuffixReservoir[0:oneRange.Start] {
 				k := make(Key, len(key))
 				copy(k, key)
-				childStats.RSuffixReservoir = append(childStats.RSuffixReservoir, k)
+				frontChildStats.RSuffixReservoir = append(frontChildStats.RSuffixReservoir, k)
 			}
 			for _, key := range WSuffixReservoir[lastWRangeIndex:currentWRangeIndex] {
 				k := make(Key, len(key))
 				copy(k, key)
-				childStats.WSuffixReservoir = append(childStats.WSuffixReservoir, k)
+				frontChildStats.WSuffixReservoir = append(frontChildStats.WSuffixReservoir, k)
 			}
 
-			frontChild := newHeatNode(nextLevel, frontRangeStart, oneRange.CommonPrefix, Key{}, childStatsID)
+			frontChild := newHeatNode(nextLevel, frontRangeStart, oneRange.CommonPrefix, Key{}, frontChildStatsID)
 			lastWRangeIndex = currentWRangeIndex
 			children = append(children, frontChild)
 			splitKeys = append(splitKeys, oneRange.CommonPrefix)
 		}
-		// 加入目前区域的子节点
+
+		// NOTE:加入目前区域的子节点
 		childRangeEnd := NextKeySameLength(oneRange.CommonPrefix)         // 将前缀+1设置为结尾
 		rangeRation = float64(oneRange.End-oneRange.Start) / ReservoirCap // 自动转型
 		wRangeRation, currentWRangeIndex = CalculateRangeRatio(lastWRangeIndex, childRangeEnd, WSuffixReservoir)
@@ -349,6 +379,10 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 		childStats := m.getStats(childStatsID)
 		childStats.ReadCount = int64(rangeReadCount * rangeRation)
 		childStats.WriteCount = int64(rangeWriteCount * wRangeRation)
+		childStats.EpochStartWrite = childStats.WriteCount
+		if childStats.WriteCount > 0 {
+			childStats.OverwriteRation = fatherOverwriteRation
+		}
 
 		// 重点：剥离前缀！(oneRange.CommonPrefix)
 		pathSegLen := len(oneRange.CommonPrefix)
@@ -374,6 +408,7 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 		children = append(children, child)
 		splitKeys = append(splitKeys, childRangeEnd)
 
+		// NOTE:下面开始加入尾部间隙节点
 		var afterChildRangeEnd Key // 尾部间隙在Key值范围上结束的值
 		var afterChildIndexEnd int // 尾部间隙在蓄水池上结束的索引
 		if i == len(PrefixGroups)-1 {
@@ -400,6 +435,10 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 			afterChildStats := m.getStats(afterChildStatsID)
 			afterChildStats.ReadCount = int64(rangeReadCount * rangeRation)
 			afterChildStats.WriteCount = int64(rangeWriteCount * wRangeRation)
+			afterChildStats.EpochStartWrite = afterChildStats.WriteCount
+			if afterChildStats.WriteCount > 0 {
+				afterChildStats.OverwriteRation = fatherOverwriteRation
+			}
 
 			for _, key := range RSuffixReservoir[oneRange.End:afterChildIndexEnd] {
 				k := make(Key, len(key))
