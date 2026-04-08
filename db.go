@@ -544,10 +544,10 @@ func (db *DB) Close() error {
 		err = db.close()
 	})
 	// zzlHACK:
-	// defer func() {
-	// 	db.zzlHeatmap.Print()
-	// 	db.zzlTracker.PrintTopK(100)
-	// }()
+	defer func() {
+		db.zzlHeatmap.Print()
+		db.zzlTracker.PrintTopK(100)
+	}()
 	// zzlHACK:END
 	return err
 }

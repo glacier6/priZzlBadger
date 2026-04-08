@@ -470,7 +470,7 @@ func (txn *Txn) Delete(key []byte) error {
 // NOTE:2026031800 YCSB的读取目前用的这个函数
 func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	// zzlHACK:记录读
-	txn.db.zzlHeatmap.MotherTree.Root.SearchLeaf(key, true, txn.db.zzlHeatmap)
+	// txn.db.zzlHeatmap.MotherTree.Root.SearchLeaf(key, true, txn.db.zzlHeatmap)
 	// go txn.db.zzlTracker.RecordRead(key)
 	// zzlHACK:END
 	if len(key) == 0 {

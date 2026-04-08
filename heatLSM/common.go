@@ -184,46 +184,6 @@ func CompareKey(a, b Key) int {
 	return bytes.Compare(a, b)
 }
 
-// 辅助函数：深度优先遍历打印树结构
-// 【重构】：增加 m *HeatmapManager 参数，用于通过 StatsID 寻址真实数据
-func PrintTree(node *HeatNode, prefix string, m *HeatmapManager) {
-	if node == nil {
-		return
-	}
-
-	var readCount, writeCount int64
-	var sampleCount int
-
-	// 如果 StatsID 不为 -1，说明它有绑定的物理统计数据（通常是叶子节点）
-	if node.StatsID != -1 {
-		// O(1) 极速去底层内存池捞数据
-		stats := m.getStats(node.StatsID)
-		readCount = stats.ReadCount
-		writeCount = stats.WriteCount
-		sampleCount = len(stats.RSuffixReservoir)
-	}
-
-	fmt.Printf("%sLvl:%d Path:[%s] Range:[%s-%s) Leaf:%v Read:%d Write:%d Sample:%d\n",
-		prefix,
-		node.Level,
-		string(node.PathSegment),
-		string(node.RangeStart),
-		string(node.RangeEnd),
-		node.IsLeaf,
-		readCount,   // 从 Manager 捞出来的读计数
-		writeCount,  // 从 Manager 捞出来的写计数
-		sampleCount, // 从 Manager 捞出来的蓄水池大小
-	)
-
-	for i, child := range node.Children {
-		// 递归调用时，记得把 Manager 继续传下去
-		PrintTree(child, prefix+"  ", m)
-		if i < len(node.SplitRangeKey) {
-			fmt.Printf("%s  [Split: %s]\n", prefix, string(node.SplitRangeKey[i]))
-		}
-	}
-}
-
 // NextKeySameLength 返回在字典序上比输入 key 大 1 的 Key。
 // 约束：返回的 Key 长度与输入 Key 严格一致。
 // 注意：如果输入是全 0xFF (例如 [255, 255])，加 1 后会发生溢出回绕变成全 0x00。

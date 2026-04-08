@@ -5,8 +5,6 @@ import (
 	"math/rand"
 	"testing"
 	"time"
-
-	"github.com/valyala/fastrand"
 )
 
 // 辅助函数：生成测试 Key
@@ -37,7 +35,7 @@ func TestHeatNode_Evolve_Integration(t *testing.T) {
 	// 这样分裂时应该能识别出 "a", "b", "c" 或者更长的前缀
 	prefixes := []string{"apple", "banana", "cherry", "date"}
 
-	totalOps := 1000000 // 足够触发分裂 (Threshold=1024)
+	totalOps := 100000 // 足够触发分裂 (Threshold=1024)
 	var leaf *HeatNode
 	fmt.Println("--- Phase 1: Injecting Data ---")
 	for i := 0; i < totalOps; i++ {
@@ -46,14 +44,14 @@ func TestHeatNode_Evolve_Integration(t *testing.T) {
 		key := generateKey(p, 10) // 长度10的key
 
 		// 模拟读取写入操作 (isRead = true)
-		if fastrand.Uint32n(3) == 0 {
-			// 写入
-			// 【重构】：SearchLeaf 必须带上 manager 传递到底层
-			leaf = root.SearchLeaf(key, false, manager)
-		} else {
-			// 读取
-			leaf = root.SearchLeaf(key, true, manager)
-		}
+		// if fastrand.Uint32n(3) == 0 {
+		// 写入
+		// 【重构】：SearchLeaf 必须带上 manager 传递到底层
+		leaf = root.SearchLeaf(key, false, manager)
+		// } else {
+		// 	// 读取
+		// 	leaf = root.SearchLeaf(key, true, manager)
+		// }
 
 		if leaf == nil {
 			t.Fatalf("SearchLeaf returned nil for key: %s", key)
@@ -101,10 +99,10 @@ func TestHeatNode_Evolve_Integration(t *testing.T) {
 		var readCount int64 = 0
 		if leaf.StatsID != -1 {
 			stats := manager.getStats(leaf.StatsID)
-			readCount = stats.ReadCount
+			readCount = stats.WriteCount
 		}
 
-		fmt.Printf("Key [%s] routed to Leaf with PathSegment [%s], Level: [%d], Range:[%s-%s), RealReadCount: %d\n",
+		fmt.Printf("Key [%s] routed to Leaf with PathSegment [%s], Level: [%d], Range:[%s-%s), WriteCount: %d\n",
 			k, leaf.PathSegment, leaf.Level, leaf.RangeStart, leaf.RangeEnd, readCount)
 	}
 }

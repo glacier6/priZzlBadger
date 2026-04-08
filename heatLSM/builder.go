@@ -16,8 +16,7 @@ import (
 
 const (
 	// 蓄水池容量：叶子节点最多存多少个样本触发分裂检查
-	ReservoirCap  = 256 // NOTE:需要大于等于256，避免极端情况下找不到一个有公共前缀的区间
-	WReservoirCap = 64
+	WReservoirCap = 256
 	// 树节点读写比达到多少停止分裂
 	TargetRatio = 3
 
@@ -36,24 +35,20 @@ type Key []byte
 type RegionStats struct {
 	IsActive bool // 标记该槽位是否在使用中，方便复用
 
-	ReadCount  int64 // 读写计数用int类型,这样在cpu内只需要执行一次自增即可,花费时间最少
-	WriteCount int64
+	WriteCount int64 // 读写计数用int类型,这样在cpu内只需要执行一次自增即可,花费时间最少
 
 	OverwriteRation float64 // 覆写率,NOTE:注意覆写率不能直接实时计算,所以这里的OverwriteRation实际是上一轮周期结束时的 本轮周期覆写率和上轮覆写率的权重合
 	// inheritOverwriteRation float64             // 从父节点或者上一轮周期继承的覆写率
 	EpochStartWrite int64               // 本轮周期的开始时的写入量,WriteCount - EpochStartWrite等于当前周期的写入量
 	CurrentHLL      *hyperloglog.Sketch // 用于覆写率
 
-	TotalSamplesSeen int64
-	RSuffixReservoir []Key // 注意这个还有下面这个俩蓄水池在StatsChunks存储的是一个指针,并不是直接在StatsChunks内
-	WSuffixReservoir []Key
+	WSuffixReservoir []Key // 注意这个蓄水池在StatsChunks存储的是一个指针,并不是直接在StatsChunks内
 }
 
 type HeatNode struct {
 	// --- 树形结构与前缀压缩 ---
 	Level          int64 // 当前节点所在层级
-	SplitThreshold int64 // 读分裂阈值：读热度超过此值，且样本满了，才允许分裂（只读热分裂）
-	isTargetRange  bool  // 判断是否是达到TargetRatio的目标节点
+	SplitThreshold int64 // 读分裂阈值：写热度超过此值，且样本满了，才允许分裂
 	RangeStart     Key   // RangeStart和RangeEnd构造出左闭右开的区间（注意这俩是针对父亲的范围分割，且同一层的节点范围合并起来就是父节点的全域，即向上看。且注意存储的是逐层拼接的增量Key）
 	RangeEnd       Key   // nil 代表无穷大
 	PathSegment    Key   // 当前节点代表的公共前缀片段。完整 Key = 父节点Prefix + ... + 当前Prefix + Suffix（注意是逐层拼接的增量Key）
@@ -85,7 +80,7 @@ type HeatmapManager struct {
 
 	// 子树：结构易变，负责收集近期突发流量
 	// 子树的结构会定期“重置”或“对齐”母树
-	ChildTree *HeatmapTree
+	// ChildTree *HeatmapTree
 
 	// 全局锁：仅在 "母子合并 (Merge)" 和 "结构进化" 时使用
 	evolutionLock sync.Mutex
@@ -115,14 +110,12 @@ func (m *HeatmapManager) AllocateStats() int32 {
 		m.FreeList = m.FreeList[:len(m.FreeList)-1]
 		stats := m.getStats(id)
 		stats.IsActive = true
-		stats.ReadCount = 0
 		stats.WriteCount = 0
 		stats.EpochStartWrite = 0
 		stats.CurrentHLL = hyperloglog.New14() // 构造一个新的Sparse HLL
 		stats.OverwriteRation = 0.0            // 默认覆盖率等均为0,如果有遗传,那么外面再覆盖它
 
-		stats.RSuffixReservoir = stats.RSuffixReservoir[:0] // 保留容量，清空数据
-		stats.WSuffixReservoir = stats.WSuffixReservoir[:0]
+		stats.WSuffixReservoir = stats.WSuffixReservoir[:0] // 保留容量，清空数据
 		return id
 	}
 
@@ -143,7 +136,6 @@ func (m *HeatmapManager) AllocateStats() int32 {
 		IsActive:         true,
 		CurrentHLL:       hyperloglog.New14(),
 		OverwriteRation:  0.0,
-		RSuffixReservoir: make([]Key, 0, ReservoirCap),
 		WSuffixReservoir: make([]Key, 0, WReservoirCap),
 	})
 
@@ -157,7 +149,6 @@ func (m *HeatmapManager) FreeStats(id int32) {
 	stats := m.getStats(id)
 	stats.IsActive = false
 	// 注意：不释放切片的底层数组，留作下次分配复用，减少 GC 压力
-	stats.RSuffixReservoir = stats.RSuffixReservoir[:0]
 	stats.WSuffixReservoir = stats.WSuffixReservoir[:0]
 	m.FreeList = append(m.FreeList, id)
 }
@@ -173,7 +164,6 @@ func newHeatNode(Level int64, start, end Key, pathSeg Key, statsID int32) *HeatN
 		RangeEnd:       end,
 		PathSegment:    pathSeg,
 		IsLeaf:         true,
-		isTargetRange:  false,
 		StatsID:        statsID, // 绑定灵魂！
 	}
 	return n
@@ -204,6 +194,10 @@ func NewHeatmapManager() *HeatmapManager {
 // keySuffix: 已经剥离了当前节点 Prefix 的后缀部分
 // 【重构】：增加 manager 参数，以直接定位底层物理内存
 func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
+	if isRead {
+		return
+	}
+
 	n.Lock()
 	defer n.Unlock()
 
@@ -214,49 +208,27 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
 	// 【核心改变】：通过 StatsID 从连续内存池中获取真实数据！
 	stats := m.getStats(n.StatsID)
 
-	if isRead {
-		stats.ReadCount++
-		// 3. 场景 A: 蓄水池未满 -> 直接追加
-		if len(stats.RSuffixReservoir) < ReservoirCap {
-			k := make(Key, len(keySuffix))
-			copy(k, keySuffix)
-			stats.RSuffixReservoir = append(stats.RSuffixReservoir, k)
-			return
-		}
-
-		// 4. 场景 B: 蓄水池已满 -> 随机替换 (Algorithm R)
-		limit := uint32(stats.ReadCount)
-		r := fastrand.Uint32n(limit)
-
-		if r < uint32(ReservoirCap) {
-			k := make(Key, len(keySuffix))
-			copy(k, keySuffix)
-			stats.RSuffixReservoir[r] = k
-		}
-
-		if stats.ReadCount > n.SplitThreshold && len(stats.RSuffixReservoir) == ReservoirCap {
-			n.Evolve(m) // 传入 manager
-		}
-	} else {
-		stats.WriteCount++
-		stats.CurrentHLL.Insert(keySuffix)               // 喂给HLL,来算覆写率
-		if len(stats.WSuffixReservoir) < WReservoirCap { // 这里修复了你原代码中小 bug，写入应判断 WReservoirCap
-			k := make(Key, len(keySuffix))
-			copy(k, keySuffix)
-			stats.WSuffixReservoir = append(stats.WSuffixReservoir, k)
-			return
-		}
-
-		limit := uint32(stats.WriteCount)
-		r := fastrand.Uint32n(limit)
-
-		if r < uint32(WReservoirCap) {
-			k := make(Key, len(keySuffix))
-			copy(k, keySuffix)
-			stats.WSuffixReservoir[r] = k
-		}
+	stats.WriteCount++
+	stats.CurrentHLL.Insert(keySuffix)               // 喂给HLL,来算覆写率
+	if len(stats.WSuffixReservoir) < WReservoirCap { // 这里修复了你原代码中小 bug，写入应判断 WReservoirCap
+		k := make(Key, len(keySuffix))
+		copy(k, keySuffix)
+		stats.WSuffixReservoir = append(stats.WSuffixReservoir, k)
 		return
 	}
+
+	limit := uint32(stats.WriteCount)
+	r := fastrand.Uint32n(limit)
+
+	if r < uint32(WReservoirCap) {
+		k := make(Key, len(keySuffix))
+		copy(k, keySuffix)
+		stats.WSuffixReservoir[r] = k
+	}
+	if stats.WriteCount > n.SplitThreshold && len(stats.WSuffixReservoir) == WReservoirCap {
+		n.Evolve(m) // 传入 manager
+	}
+	return
 }
 
 // Evolve 是核心分裂方法
@@ -265,14 +237,11 @@ func (n *HeatNode) Evolve(m *HeatmapManager) {
 	stats := m.getStats(n.StatsID)
 
 	// 先对蓄水池中的Key后缀进行排序
-	sort.Slice(stats.RSuffixReservoir, func(i, j int) bool {
-		return bytes.Compare(stats.RSuffixReservoir[i], stats.RSuffixReservoir[j]) < 0
-	})
 	sort.Slice(stats.WSuffixReservoir, func(i, j int) bool {
 		return bytes.Compare(stats.WSuffixReservoir[i], stats.WSuffixReservoir[j]) < 0
 	})
 
-	PrefixGroups := FindTopNPrefixGroups(stats.RSuffixReservoir, MaxValidRange)
+	PrefixGroups := FindTopNPrefixGroups(stats.WSuffixReservoir, MaxValidRange)
 
 	sort.Slice(PrefixGroups, func(i, j int) bool {
 		return PrefixGroups[i].Start < PrefixGroups[j].Start
@@ -284,13 +253,15 @@ func (n *HeatNode) Evolve(m *HeatmapManager) {
 		n.IsLeaf = false
 		n.Children = childrenNodes
 		n.SplitRangeKey = splitKeys
-
-		// 【神级回收】：当前节点已经变成普通路由节点，它不再需要保留笨重的统计数据了！
+		// 【回收】：当前节点已经变成普通路由节点，它不再需要保留笨重的统计数据了！
 		// 释放它占用的内存池槽位，供给未来新的叶子节点使用！
 		m.FreeStats(n.StatsID)
 		n.StatsID = -1
 	} else {
 		fmt.Print("出错了，子节点的个数为0？？？")
+		// 不要只是打印！如果是极其倾斜的数据导致无法分裂，我们采用“指数退避”：
+		// 直接把阈值翻倍，等攒够更多、更杂的数据再来尝试分裂！
+		n.SplitThreshold *= 2
 	}
 }
 
@@ -310,31 +281,31 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 
 	// 获取父节点的物理数据
 	stats := m.getStats(node.StatsID)
-	RSuffixReservoir := stats.RSuffixReservoir
 	WSuffixReservoir := stats.WSuffixReservoir
 
 	nextLevel := node.Level + 1
-	rangeRation := 0.0
 	wRangeRation := 0.0
 	fatherOverwriteRation := 0.0 // 存的是父节点当前的覆写率
 	lastWRangeIndex := 0
 	currentWRangeIndex := 0
-	rangeReadCount := float64(stats.ReadCount)
 	rangeWriteCount := float64(stats.WriteCount)
-	if stats.WriteCount > 0 {
+
+	// 下面这个if先计算出当前父节点的覆写率
+	epochWrites := stats.WriteCount - stats.EpochStartWrite // 算出本周期真实的写入量
+	if epochWrites > 0 {
 		uniqueKeys := float64(stats.CurrentHLL.Estimate())
-		fatherCurentOverwriteRation := 1.0 - (uniqueKeys / rangeWriteCount)
+		fatherCurentOverwriteRation := 1.0 - (uniqueKeys / float64(epochWrites))
 		fatherOverwriteRation = fatherCurentOverwriteRation*0.5 + stats.OverwriteRation*0.5 // 计算出当前父节点的覆写率,TODO:比例需要确定
 		// TODO:如何确定父节点的覆写率,这个和衰退周期有关!需要确定了衰退周期再决定.感觉应该随着每衰退一轮,就计算一次覆写率,计算的同时清空HLL
 		if fatherOverwriteRation < 0 {
 			fatherOverwriteRation = 0
 		}
 	}
+
 	// 遍历选中的区间（每一轮最多可以增加3个子节点【头部间隙节点(仅第一个元素会加)、当前具有公共前缀的区间节点、尾部间隙节点】）
 	for i, oneRange := range PrefixGroups {
 		if i == 0 {
 			// NOTE:如果是第一个元素,需要加入头部间隙
-			rangeRation = float64(oneRange.Start) / float64(ReservoirCap)
 			wRangeRation, currentWRangeIndex = CalculateRangeRatio(lastWRangeIndex, oneRange.CommonPrefix, WSuffixReservoir)
 			frontRangeStart := Key{} // 如果父节点有公共前缀，那么父节点的起始节点就应该等于公共前缀，所以下一层头部间隙就应该为空
 			if len(node.PathSegment) == 0 {
@@ -345,18 +316,13 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 			// 【重构核心】：为新的间隙节点向大内存池申请一块空间
 			frontChildStatsID := m.AllocateStats()
 			frontChildStats := m.getStats(frontChildStatsID)
-			frontChildStats.ReadCount = int64(rangeReadCount * rangeRation)
 			frontChildStats.WriteCount = int64(rangeWriteCount * wRangeRation)
 			frontChildStats.EpochStartWrite = frontChildStats.WriteCount
 			if frontChildStats.WriteCount > 0 {
 				frontChildStats.OverwriteRation = fatherOverwriteRation
 			}
+
 			// 继承并拷贝对应的蓄水池数据 (因为是间隙节点，无公共前缀，不需要剥离)
-			for _, key := range RSuffixReservoir[0:oneRange.Start] {
-				k := make(Key, len(key))
-				copy(k, key)
-				frontChildStats.RSuffixReservoir = append(frontChildStats.RSuffixReservoir, k)
-			}
 			for _, key := range WSuffixReservoir[lastWRangeIndex:currentWRangeIndex] {
 				k := make(Key, len(key))
 				copy(k, key)
@@ -370,14 +336,12 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 		}
 
 		// NOTE:加入目前区域的子节点
-		childRangeEnd := NextKeySameLength(oneRange.CommonPrefix)         // 将前缀+1设置为结尾
-		rangeRation = float64(oneRange.End-oneRange.Start) / ReservoirCap // 自动转型
+		childRangeEnd := NextKeySameLength(oneRange.CommonPrefix) // 将前缀+1设置为结尾
 		wRangeRation, currentWRangeIndex = CalculateRangeRatio(lastWRangeIndex, childRangeEnd, WSuffixReservoir)
 
 		// 【重构核心】：为当前具有公共前缀的有效区间申请空间
 		childStatsID := m.AllocateStats()
 		childStats := m.getStats(childStatsID)
-		childStats.ReadCount = int64(rangeReadCount * rangeRation)
 		childStats.WriteCount = int64(rangeWriteCount * wRangeRation)
 		childStats.EpochStartWrite = childStats.WriteCount
 		if childStats.WriteCount > 0 {
@@ -386,14 +350,6 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 
 		// 重点：剥离前缀！(oneRange.CommonPrefix)
 		pathSegLen := len(oneRange.CommonPrefix)
-		for _, key := range RSuffixReservoir[oneRange.Start:oneRange.End] {
-			if len(key) >= pathSegLen {
-				suffix := key[pathSegLen:]
-				k := make(Key, len(suffix))
-				copy(k, suffix)
-				childStats.RSuffixReservoir = append(childStats.RSuffixReservoir, k)
-			}
-		}
 		for _, key := range WSuffixReservoir[lastWRangeIndex:currentWRangeIndex] {
 			if len(key) >= pathSegLen {
 				suffix := key[pathSegLen:]
@@ -410,10 +366,8 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 
 		// NOTE:下面开始加入尾部间隙节点
 		var afterChildRangeEnd Key // 尾部间隙在Key值范围上结束的值
-		var afterChildIndexEnd int // 尾部间隙在蓄水池上结束的索引
 		if i == len(PrefixGroups)-1 {
 			// 如果是最后一个区间
-			afterChildIndexEnd = ReservoirCap
 			afterChildRangeEnd = Key{} // NOTE:如果父节点有公共前缀，那么子节点的尾部间隙同头部间隙一样，均设值为空！！
 			if len(node.PathSegment) == 0 {
 				// 如果父节点无公共前缀，那么下一层尾部间隙就应该等于父节点的结尾
@@ -422,29 +376,21 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 		} else {
 			// 如果是普通的区间之间间隙
 			afterChildRangeEnd = PrefixGroups[i+1].CommonPrefix
-			afterChildIndexEnd = PrefixGroups[i+1].Start
 		}
 		// 如果当前区间的尾部和间隙的尾部相同，那么就不用加间隙了！
 		if CompareKey(afterChildRangeEnd, childRangeEnd) != 0 {
 			// 加尾部间隙
-			rangeRation = float64(afterChildIndexEnd-oneRange.End) / ReservoirCap
 			wRangeRation, currentWRangeIndex = CalculateRangeRatio(lastWRangeIndex, afterChildRangeEnd, WSuffixReservoir)
 
 			// 申请尾部间隙空间
 			afterChildStatsID := m.AllocateStats()
 			afterChildStats := m.getStats(afterChildStatsID)
-			afterChildStats.ReadCount = int64(rangeReadCount * rangeRation)
 			afterChildStats.WriteCount = int64(rangeWriteCount * wRangeRation)
 			afterChildStats.EpochStartWrite = afterChildStats.WriteCount
 			if afterChildStats.WriteCount > 0 {
 				afterChildStats.OverwriteRation = fatherOverwriteRation
 			}
 
-			for _, key := range RSuffixReservoir[oneRange.End:afterChildIndexEnd] {
-				k := make(Key, len(key))
-				copy(k, key)
-				afterChildStats.RSuffixReservoir = append(afterChildStats.RSuffixReservoir, k)
-			}
 			for _, key := range WSuffixReservoir[lastWRangeIndex:currentWRangeIndex] {
 				k := make(Key, len(key))
 				copy(k, key)
@@ -527,27 +473,34 @@ func (n *HeatNode) SearchLeaf(key Key, isRead bool, m *HeatmapManager) *HeatNode
 	}
 }
 
-// CalculateTreeMemory 递归计算整棵树的近似内存占用（单位：字节）
-// 如果想统计全貌，可以在 Manager 侧通过 len(StatsChunks) 计算大块物理内存
+// =========================================================================
+// 宏观统计与可视化打印模块
+// =========================================================================
+// =========================================================================
+// 内存精确计算模块 (用于论文数据的极致严谨性)
+// =========================================================================
+
+// CalculateTreeMemory 递归计算整棵路由树的近似内存占用（单位：字节）
 func (n *HeatNode) CalculateTreeMemory() int64 {
 	if n == nil {
 		return 0
 	}
 
-	// 1. 结构体本身的基础大小 (64位机器下，指针、int64、切片头等加起来大概 150 字节左右)
-	var size int64 = 150
-	// 2. 累加 PathSegment 和边界 Key 的底层字节大小
+	// 1. 结构体本身的基础大小 (64位机器下，指针、int64、切片头等加起来瘦身后大概 120 字节)
+	var size int64 = 120
+
+	// 2. 累加 PathSegment 和边界 Key 的底层真实字节大小
 	size += int64(len(n.PathSegment))
 	size += int64(len(n.RangeStart))
 	size += int64(len(n.RangeEnd))
 
 	// 3. 累加 SplitRangeKey 数组的大小
-	// 切片本身有一定的容量开销，加上每个 []byte 内部的真实长度
 	size += int64(cap(n.SplitRangeKey) * 24) // 切片头开销
 	for _, key := range n.SplitRangeKey {
 		size += int64(len(key))
 	}
 
+	// 4. 累加子节点指针数组开销及递归
 	size += int64(cap(n.Children) * 8)
 	for _, child := range n.Children {
 		size += child.CalculateTreeMemory()
@@ -556,7 +509,7 @@ func (n *HeatNode) CalculateTreeMemory() int64 {
 	return size
 }
 
-// CalculatePoolMemory 精确计算集中式内存池占据的物理内存大小 (单位：字节)
+// CalculatePoolMemory 精确计算集中式内存池 (RegionStats) 占据的物理内存大小
 func (m *HeatmapManager) CalculatePoolMemory() int64 {
 	var size int64 = 0
 
@@ -564,42 +517,33 @@ func (m *HeatmapManager) CalculatePoolMemory() int64 {
 		return 0
 	}
 
-	// 1. 外层切片 StatsChunks 本身的开销 (切片头 24 字节)
-	size += 24
-	// 外层切片底层数组的开销 (存的是内层切片的头，每个 24 字节)
+	// 1. 外层切片 StatsChunks 本身的开销
+	size += 24 // 切片头
 	size += int64(cap(m.StatsChunks) * 24)
 
 	// 2. 遍历每一个 Chunk 计算内存
 	for _, chunk := range m.StatsChunks {
-		// RegionStats 结构体本身的基础大小预估：
-		// IsActive(1字节+7字节对齐) + ReadCount(8) + WriteCount(8) + TotalSamplesSeen(8)
-		// + RSuffixReservoir切片头(24) + WSuffixReservoir切片头(24) = 80 字节
-		size += int64(cap(chunk) * 80)
+		// 🚀 瘦身后的 RegionStats 结构体预估：
+		// IsActive(8字节对齐) + WriteCount(8) + OverwriteRatio(8) + EpochStartWrite(8)
+		// + CurrentHLL指针(8) + WSuffixReservoir切片头(24) = 64 字节！(比原来省了近一半)
+		size += int64(cap(chunk) * 64)
 
 		// 3. 深入当前 Chunk 的每一个槽位，计算动态蓄水池的开销
-		// 注意：即使 IsActive 为 false (空洞)，只要它的蓄水池没被设为 nil，容量开销就还在！
 		for i := range chunk {
 			stats := &chunk[i]
-
-			// --- 读蓄水池 ---
-			// 蓄水池底层数组的开销：存的是 Key([]byte) 的切片头，每个 24 字节
-			size += int64(cap(stats.RSuffixReservoir) * 24)
-			// 遍历实际装入的 Key，累加底层真实 byte 数组的长度 (真实堆内存)
-			for _, key := range stats.RSuffixReservoir {
-				size += int64(len(key))
-			}
-
-			// --- 写蓄水池 ---
+			// --- 写蓄水池真实堆内存 ---
 			size += int64(cap(stats.WSuffixReservoir) * 24)
 			for _, key := range stats.WSuffixReservoir {
 				size += int64(len(key))
 			}
+			// 注：Sparse HLL 极轻量，这里暂不计算其偶尔膨胀为 Dense 时的 16KB，
+			// 因为绝大多数冷节点都是 0 分配，如果追求极度严谨，你可以在未来给 HLL 加个 Size() 方法
 		}
 	}
 
 	// 4. 计算回收站 (FreeList) 的开销
 	size += 24                         // FreeList 切片头
-	size += int64(cap(m.FreeList) * 4) // 底层数组存的是 int32，每个 4 字节
+	size += int64(cap(m.FreeList) * 4) // int32 是 4 字节
 
 	return size
 }
@@ -612,22 +556,80 @@ func (m *HeatmapManager) CalculateTotalMemory() int64 {
 	}
 
 	poolMem := m.CalculatePoolMemory()
-
-	// 如果你有单独打印需求，可以解开下面的注释
-	// fmt.Printf("[内存统计] 树(路由)占用: %d bytes, 池(数据)占用: %d bytes\n", treeMem, poolMem)
-
 	return treeMem + poolMem
 }
 
-// Print 打印整棵母树的热力分布
-func (m *HeatmapManager) Print() {
-	fmt.Println("================ 热力树拓扑结构 ================")
-	if m.MotherTree != nil && m.MotherTree.Root != nil {
-		PrintTree(m.MotherTree.Root, "", m)
+// PrintTree 递归美化打印树节点及其覆写率 (核心可视化逻辑)
+// isLast 用于控制漂亮的树形连接线符号 (├── vs └──)
+func PrintTree(node *HeatNode, prefix string, isLast bool, m *HeatmapManager) {
+	if node == nil {
+		return
 	}
-	fmt.Println("================================================")
 
-	// 你甚至可以顺手打印一下内存池的利用率，感受 DOD 架构的魅力
+	// 优化边界 Key 的显示：空字节数组在逻辑上代表负无穷或正无穷
+	startStr := string(node.RangeStart)
+	if len(node.RangeStart) == 0 {
+		startStr = "-∞"
+	}
+	endStr := string(node.RangeEnd)
+	if len(node.RangeEnd) == 0 {
+		endStr = "+∞"
+	}
+	pathStr := string(node.PathSegment)
+	if len(node.PathSegment) == 0 {
+		pathStr = "ROOT"
+	}
+
+	// 确定树形分支的符号
+	marker := "├──"
+	if isLast {
+		marker = "└──"
+	}
+
+	// 核心输出：分别处理叶子节点和路由节点
+	if node.IsLeaf {
+		if node.StatsID != -1 {
+			// 🚀 灵魂与肉体结合：去内存池里把真实的统计数据捞出来
+			stats := m.getStats(node.StatsID)
+
+			// 打印极其重要的覆写率和绝对写入量！
+			fmt.Printf("%s%s [Lv%d 叶子] 范围:[%s, %s) | 前缀:'%s' | 💥写次数:%d | 🔥覆写率: %.4f\n",
+				prefix, marker, node.Level, startStr, endStr, pathStr, stats.WriteCount, stats.OverwriteRation)
+		} else {
+			// 防御性输出（理论上不会发生）
+			fmt.Printf("%s%s [Lv%d 叶子] 范围:[%s, %s) | 前缀:'%s' | ❌ 丢失StatsID\n",
+				prefix, marker, node.Level, startStr, endStr, pathStr)
+		}
+	} else {
+		// 路由节点不需要去查内存池，它只负责切分空间
+		fmt.Printf("%s%s [Lv%d 路由] 范围:[%s, %s) | 前缀:'%s' | 🌿子节点数:%d\n",
+			prefix, marker, node.Level, startStr, endStr, pathStr, len(node.Children))
+
+		// 准备递归遍历子节点的缩进前缀
+		newPrefix := prefix
+		if isLast {
+			newPrefix += "    " // 如果父节点是最后一个，子节点前缀为空白
+		} else {
+			newPrefix += "│   " // 否则需要一条向下的垂线
+		}
+
+		// 递归遍历所有子节点
+		for i, child := range node.Children {
+			isChildLast := (i == len(node.Children)-1)
+			PrintTree(child, newPrefix, isChildLast, m)
+		}
+	}
+}
+
+// Print 打印整棵母树的热力分布与内存池状态
+func (m *HeatmapManager) Print() {
+	fmt.Println("\n================ 🌳 heatLSM 热力树拓扑与覆写率全景图 🌳 ================")
+	if m.MotherTree != nil && m.MotherTree.Root != nil {
+		// 从根节点开始递归打印，初始前缀为空，且根节点作为其所在层级的“最后一个节点”
+		PrintTree(m.MotherTree.Root, "", true, m)
+	}
+	fmt.Println("========================================================================")
+
 	activeCount := 0
 	for _, chunk := range m.StatsChunks {
 		for _, stat := range chunk {
@@ -636,7 +638,6 @@ func (m *HeatmapManager) Print() {
 			}
 		}
 	}
-	fmt.Printf("[内存池状态] 活跃节点数: %d, 回收站空洞数: %d\n", activeCount, len(m.FreeList))
-	fmt.Printf("当前热力图总内存占用: %s\n", FormatBytes(m.CalculateTotalMemory()))
-
+	fmt.Printf("📊 [系统内存雷达] 活跃区块数: %d, 回收站空洞数: %d\n", activeCount, len(m.FreeList))
+	fmt.Printf("💾 [总物理内存开销] %s\n\n", FormatBytes(m.CalculateTotalMemory()))
 }
