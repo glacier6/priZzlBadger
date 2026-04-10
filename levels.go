@@ -36,7 +36,7 @@ type levelsController struct {
 
 	// The following are initialized once and const.
 	levels []*levelHandler // 各层处理的把柄
-	// zzlHACK:4800
+	// zzlHACK:4800 新增hotTier控制结构
 	hotTier *levelHandler
 	// zzlHACK:END
 	kv *DB
@@ -165,7 +165,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 
 			mu.Lock()
 			//-- tables[tf.Level] = append(tables[tf.Level], t)
-			// zzlHACK:4800
+			// zzlHACK:4800 初始化hotTier的hotTables
 			if tf.Level == 99 {
 				// 如果是从 Manifest 读出来的热点文件，放进专区
 				hotTables = append(hotTables, t)
@@ -1744,6 +1744,71 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 			err = decErr
 		}
 	}()
+	// zzlHACK:统计输出压缩情况
+	// 辅助函数：格式化输出 SSTable 列表的详情
+	// formatTablesInfo := func(tables []*table.Table) string {
+	// 	if len(tables) == 0 {
+	// 		return "  None\n"
+	// 	}
+
+	// 	// 限制字符串长度的辅助函数
+	// 	limitStr := func(s string, maxLen int) string {
+	// 		if len(s) > maxLen {
+	// 			return s[:maxLen] + "..."
+	// 		}
+	// 		return s
+	// 	}
+
+	// 	var res []string
+	// 	for _, t := range tables {
+	// 		// 🌟 1. 获取原始的内部 Key
+	// 		smallRaw := t.Smallest()
+	// 		bigRaw := t.Biggest()
+
+	// 		// 🌟 2. 使用 y.ParseKey 剥离掉 Badger 内部追加的 8 字节时间戳
+	// 		smallUserKey := y.ParseKey(smallRaw)
+	// 		bigUserKey := y.ParseKey(bigRaw)
+
+	// 		// 🌟 3. 转成普通的 String
+	// 		smallStr := string(smallUserKey)
+	// 		bigStr := string(bigUserKey)
+
+	// 		// 🌟 4. 使用 %s 打印字符串，YCSB 的 key 一般是 "usertable:userXXX"，放宽到 40 字符足够完整显示了
+	// 		info := fmt.Sprintf(
+	// 			"  - [ID: %06d] Size: %8.2f KB | Range: [%s -> %s]\n",
+	// 			t.ID(),
+	// 			float64(t.Size())/1024.0,
+	// 			limitStr(smallStr, 40),
+	// 			limitStr(bigStr, 40),
+	// 		)
+	// 		res = append(res, info)
+	// 	}
+	// 	return strings.Join(res, "")
+	// }
+
+	// // 准备日志详情
+	// var detailLog strings.Builder
+	// detailLog.WriteString(fmt.Sprintf("\n🔥 [Compact-%d] 层级变更: L%d -> L%d\n", id, thisLevel.level, nextLevel.level))
+
+	// detailLog.WriteString("📥 【输入阶段 - 被选中的上层 SST (Top)】:\n")
+	// detailLog.WriteString(formatTablesInfo(cd.top))
+
+	// detailLog.WriteString("📥 【输入阶段 - 涉及的底层 SST (Bot)】:\n")
+	// detailLog.WriteString(formatTablesInfo(cd.bot))
+
+	// detailLog.WriteString("📤 【输出阶段 - 生成的新冷数据 SST (New)】:\n")
+	// detailLog.WriteString(formatTablesInfo(newTables))
+
+	// if len(hotTables) > 0 {
+	// 	detailLog.WriteString("☀️ 【输出阶段 - 拦截并存入 L99 的热数据 SST (Hot)】:\n")
+	// 	detailLog.WriteString(formatTablesInfo(hotTables))
+	// }
+
+	// // 打印详尽日志
+	// s.kv.opt.Infof(detailLog.String())
+	// --- 🕵️‍♂️ 详情分析结束 ---
+	// zzlHACK:END
+
 	changeSet := buildChangeSet(&cd, newTables, hotTables) //创建一个更改集，貌似只记录一些SST级的更改，不记录更具体的如具体key的一些更改 zzlHACK:4801 多传入一个hotTables
 
 	// We write to the manifest _before_ we delete files (and after we created files)
@@ -1793,7 +1858,7 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	//下面是打印统计信息
 	from := append(tablesToString(cd.top), tablesToString(cd.bot)...)
 	to := tablesToString(newTables)
-	if dur := time.Since(timeStart); dur > 2*time.Second {
+	if dur := time.Since(timeStart); dur > 2*time.Second { // NOTE:如果本次合并时间超过2秒钟,那么就认为是昂贵的,此时才会进行打印操作
 		var expensive string
 		if dur > time.Second {
 			expensive = " [E]"

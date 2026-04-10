@@ -424,7 +424,9 @@ func (txn *Txn) modify(e *Entry) error {
 // NOTE:2026031801
 func (txn *Txn) Set(key, val []byte) error {
 	// zzlHACK:记录写
+	// if fastrand.Uint32()%100 == 0 { // 只有 1% 的天选之子才会去查树
 	txn.db.zzlHeatmap.MotherTree.Root.SearchLeaf(key, false, txn.db.zzlHeatmap)
+	// }
 	// go txn.db.zzlTracker.RecordWrite(key)
 	// zzlHACK:END
 	return txn.SetEntry(NewEntry(key, val))

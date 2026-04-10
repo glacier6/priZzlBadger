@@ -41,7 +41,8 @@ const (
 	HotRatioThreshold = 0.6
 
 	// 多少次memtable的转换触发一次衰减及更新高覆写率范围视图
-	flushThreshold = 100
+	// TODO:需要确定多少合适
+	flushThreshold = 1
 	// 目前不知道为啥,10000000条数据与操作时,为1和普通版本速度基本一致(频繁触发写入Hot),为4慢6%左右(触发写入Hot),为100慢3%左右(完全不触发写入Hot)
 )
 
@@ -452,7 +453,6 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 	return children, splitKeys
 }
 
-// 下面是触发衰减以及更新高覆写率的视图
 // 下面是触发衰减以及更新高覆写率的视图
 func (m *HeatmapManager) EpochDecayAndSnapshot() {
 	var newZones []HotZone
