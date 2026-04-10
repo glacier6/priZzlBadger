@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/axiomhq/hyperloglog"
 	"github.com/valyala/fastrand"
@@ -26,23 +27,48 @@ const (
 	// --- 【新增】：分块内存池大小 ---
 	// 每次向系统申请连续存放 1024 个统计数据的物理内存块
 	StatsChunkSize = 1024
+
+	// CurrentEpochWeight 决定了本周期“最新覆写率”在“总覆写率”中的占比。
+	// 取值范围 [0.0, 1.0]。
+	// - 值越大 (如 0.8)：系统对近期突发热点越敏感，但也更容易产生抖动。
+	// - 值越小 (如 0.2)：系统对历史热度记忆越长，平滑度极高，适合长尾热点。
+	// TODO:比例需要确定
+	// =========================================================
+	CurrentEpochWeight = 0.5
+
+	// 高低覆写率的分界线
+	// TODO:建议不要写死,写成排名制的
+	HotRatioThreshold = 0.6
+
+	// 多少次memtable的转换触发一次衰减及更新高覆写率范围视图
+	flushThreshold = 100
+	// 目前不知道为啥,10000000条数据与操作时,为1和普通版本速度基本一致(频繁触发写入Hot),为4慢6%左右(触发写入Hot),为100慢3%左右(完全不触发写入Hot)
 )
 
 type Key []byte
 
+// 记录高覆写范围的原子单位
+type HotZone struct {
+	Start Key
+	End   Key
+}
+
 // --- 【新增】：肉体（集中存储的统计数据） ---
 // 这部分数据将被紧凑地存放在 HeatmapManager 的二维分块数组里
+// NOTE:NOTE:这个原本是打算在衰减的时候用的,但是现在貌似用不到?而是因为HeatNode将负责读,而RegionStats负责写,做到读写分离,这样锁就不会加的很乱.
+// NOTE:NOTE:而且一个RegionStats加起来不大于64字节,可以放到一个CPU Cache Line(64字节内),可以提高Cpu cache命中率
 type RegionStats struct {
 	IsActive bool // 标记该槽位是否在使用中，方便复用
 
 	WriteCount int64 // 读写计数用int类型,这样在cpu内只需要执行一次自增即可,花费时间最少
 
+	// 注意一起被计算的数据，就应该被存放在一起,所以下面这三个就放在一起好了
 	OverwriteRation float64 // 覆写率,NOTE:注意覆写率不能直接实时计算,所以这里的OverwriteRation实际是上一轮周期结束时的 本轮周期覆写率和上轮覆写率的权重合
 	// inheritOverwriteRation float64             // 从父节点或者上一轮周期继承的覆写率
 	EpochStartWrite int64               // 本轮周期的开始时的写入量,WriteCount - EpochStartWrite等于当前周期的写入量
 	CurrentHLL      *hyperloglog.Sketch // 用于覆写率
 
-	WSuffixReservoir []Key // 注意这个蓄水池在StatsChunks存储的是一个指针,并不是直接在StatsChunks内
+	WSuffixReservoir []Key // 注意这个蓄水池在StatsChunks存储的是一个指针,并不是直接在StatsChunks内,所以遍历RegionStats的时候尽量不要碰这个,会导致cpu cache失效!
 }
 
 type HeatNode struct {
@@ -87,9 +113,19 @@ type HeatmapManager struct {
 
 	// --- 【新增：集中式分块物理内存池 (Chunked Pool)】 ---
 	// 使用二维数组可以完美避免 append 扩容导致的底层内存搬迁问题，并发绝对安全(第一层是指每次分配的StatsChunkSize个Chunk,第二层则是当次分配的具体的各个Chunk)
-	StatsChunks [][]RegionStats
-	FreeList    []int32    // 垃圾回收站，存放被合并/销毁的 StatsID，用于 O(1) 复用
-	poolLock    sync.Mutex // 仅在 Allocate 和 Free 时加锁，不影响高频的 AddSample
+	StatsChunks [][]RegionStats // 注意这个是定长内存池,来提高cpu cache的命中率
+	FreeList    []int32         // 垃圾回收站，存放被合并/销毁的 StatsID，用于 O(1) 复用
+	poolLock    sync.Mutex      // 仅在 Allocate 和 Free 时加锁，不影响高频的 AddSample
+
+	// NOTE:NOTE:下面这个存储的是上一周期得出的高覆写的范围快照,这个数据结构比较快
+	// atomic.Value 本质上是一个无锁的原子指针替换,读的时候没有任何加锁动作.而在写的时候,在后台开辟一块全新的内存，新的建好之后,会瞬间切过去
+	hotZonesSnapshot atomic.Value
+
+	flushThreshold int32 // 衰减和更新快照的触发阈值，例如每 4 次 Memtable Flush 更新一次快照
+
+	flushCount int32 // 原子计数器，记录发生了多少次 Flush memtable
+
+	isDecaying int32 // 标记当前是否正在执行后台衰减（0=空闲，1=正在执行
 }
 
 // --- 【新增】：内存池管理器方法 ---
@@ -172,19 +208,23 @@ func newHeatNode(Level int64, start, end Key, pathSeg Key, statsID int32) *HeatN
 // 初始化管理器 初始位置在NOTE:2026031802
 func NewHeatmapManager() *HeatmapManager {
 	m := &HeatmapManager{
-		TotalRead:   0,
-		TotalWrite:  0,
-		StatsChunks: make([][]RegionStats, 0),
-		FreeList:    make([]int32, 0),
+		TotalRead:      0,
+		TotalWrite:     0,
+		StatsChunks:    make([][]RegionStats, 0),
+		FreeList:       make([]int32, 0),
+		flushThreshold: flushThreshold,
 	}
 
 	rootStart := Key{}
 	rootEnd := Key(nil)
 
-	// 1. 初始化母树
+	// 初始化母树
 	rootStatsID := m.AllocateStats()
 	motherRoot := newHeatNode(0, rootStart, rootEnd, Key{}, rootStatsID)
 	m.MotherTree = &HeatmapTree{Root: motherRoot}
+
+	// 初始化快照组
+	m.hotZonesSnapshot.Store(make([]HotZone, 0))
 
 	return m
 }
@@ -295,11 +335,14 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 	if epochWrites > 0 {
 		uniqueKeys := float64(stats.CurrentHLL.Estimate())
 		fatherCurentOverwriteRation := 1.0 - (uniqueKeys / float64(epochWrites))
-		fatherOverwriteRation = fatherCurentOverwriteRation*0.5 + stats.OverwriteRation*0.5 // 计算出当前父节点的覆写率,TODO:比例需要确定
-		// TODO:如何确定父节点的覆写率,这个和衰退周期有关!需要确定了衰退周期再决定.感觉应该随着每衰退一轮,就计算一次覆写率,计算的同时清空HLL
-		if fatherOverwriteRation < 0 {
-			fatherOverwriteRation = 0
-		}
+		fatherOverwriteRation = fatherCurentOverwriteRation*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight) // 计算出当前父节点的覆写率
+		// 随着每衰退一轮,就计算一次覆写率,计算的同时清空HLL
+	} else {
+		// 虽然一般到分裂了,不会出现epochWrites等于0,但是还是加一个防卫一下吧
+		fatherOverwriteRation = 0.0*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
+	}
+	if fatherOverwriteRation < 0 {
+		fatherOverwriteRation = 0
 	}
 
 	// 遍历选中的区间（每一轮最多可以增加3个子节点【头部间隙节点(仅第一个元素会加)、当前具有公共前缀的区间节点、尾部间隙节点】）
@@ -409,6 +452,134 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 	return children, splitKeys
 }
 
+// 下面是触发衰减以及更新高覆写率的视图
+// 下面是触发衰减以及更新高覆写率的视图
+func (m *HeatmapManager) EpochDecayAndSnapshot() {
+	var newZones []HotZone
+
+	m.evolutionLock.Lock()
+	defer m.evolutionLock.Unlock()
+
+	// 💥 修复核心：增加 currentPrefix, parentAbsStart, parentAbsEnd 参数
+	var traverse func(node *HeatNode, currentPrefix Key, parentAbsStart Key, parentAbsEnd Key)
+	traverse = func(node *HeatNode, currentPrefix Key, parentAbsStart Key, parentAbsEnd Key) {
+		if node == nil {
+			return
+		}
+
+		node.Lock()
+		isLeaf := node.IsLeaf
+		statsID := node.StatsID
+
+		// =========================================================
+		// 🛡️ 绝对路径还原引擎：通过时空上下文，还原出该节点真实的物理边界
+		// =========================================================
+		var absStart, absEnd Key
+
+		// 还原绝对起点
+		if len(node.RangeStart) > 0 {
+			absStart = make(Key, 0, len(currentPrefix)+len(node.RangeStart))
+			absStart = append(absStart, currentPrefix...)
+			absStart = append(absStart, node.RangeStart...)
+		} else {
+			absStart = parentAbsStart // 如果自身起点是空(-∞)，则继承父节点的绝对起点
+		}
+
+		// 还原绝对终点
+		if len(node.RangeEnd) > 0 {
+			absEnd = make(Key, 0, len(currentPrefix)+len(node.RangeEnd))
+			absEnd = append(absEnd, currentPrefix...)
+			absEnd = append(absEnd, node.RangeEnd...)
+		} else {
+			absEnd = parentAbsEnd // 如果自身终点是nil(+∞)，则继承父节点的绝对终点
+		}
+
+		// 计算要传给子节点的全新前缀
+		nextPrefix := make(Key, 0, len(currentPrefix)+len(node.PathSegment))
+		nextPrefix = append(nextPrefix, currentPrefix...)
+		nextPrefix = append(nextPrefix, node.PathSegment...)
+		// =========================================================
+
+		var childrenCopy []*HeatNode
+		if !isLeaf {
+			childrenCopy = make([]*HeatNode, len(node.Children))
+			copy(childrenCopy, node.Children)
+		}
+
+		if isLeaf && statsID != -1 {
+			stats := m.getStats(node.StatsID)
+
+			epochWrites := stats.WriteCount - stats.EpochStartWrite
+			if epochWrites > 0 {
+				uniqueKeys := float64(stats.CurrentHLL.Estimate())
+				currentRatio := 1.0 - (uniqueKeys / float64(epochWrites))
+				stats.OverwriteRation = currentRatio*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
+			} else {
+				stats.OverwriteRation = 0.0*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
+			}
+			if stats.OverwriteRation < 0 {
+				stats.OverwriteRation = 0
+			}
+
+			stats.EpochStartWrite = stats.WriteCount
+			stats.CurrentHLL = hyperloglog.New14()
+
+			if stats.OverwriteRation >= HotRatioThreshold {
+				// 💥 修复核心：存入快照的必须是刚拼装好的【绝对路径】！
+				newZones = append(newZones, HotZone{
+					Start: absStart,
+					End:   absEnd,
+				})
+			}
+		}
+		node.Unlock()
+
+		for _, child := range childrenCopy {
+			// 将算好的绝对边界作为“父边界”传给子节点
+			traverse(child, nextPrefix, absStart, absEnd)
+		}
+	}
+
+	// 1. 发起一体化遍历，根节点的前缀为空，边界为绝对的全域 [-∞, +∞)
+	if m.MotherTree != nil && m.MotherTree.Root != nil {
+		traverse(m.MotherTree.Root, Key{}, Key{}, Key(nil))
+	}
+
+	// 2. 将收集到的热区排序（二分查找的先决条件）
+	sort.Slice(newZones, func(i, j int) bool {
+		return bytes.Compare(newZones[i].Start, newZones[j].Start) < 0
+	})
+
+	// 3. RCU 原子替换
+	m.hotZonesSnapshot.Store(newZones)
+}
+
+// OnMemtableFlush 是负载驱动的入口
+func (m *HeatmapManager) OnMemtableFlush() {
+	// 1. 原子增加计数
+	count := atomic.AddInt32(&m.flushCount, 1)
+
+	// 2. 检查是否达到阈值
+	if count >= m.flushThreshold {
+		// 重置计数器
+		atomic.StoreInt32(&m.flushCount, 0)
+
+		// 3. 🛡️ 终极防御：利用 CAS 实现 TryLock，保证全局只会有一个协程在做衰减！
+		// 只有当 isDecaying 是 0 时，才能把它变成 1，并返回 true。否则返回 false。
+		if atomic.CompareAndSwapInt32(&m.isDecaying, 0, 1) {
+			go func() {
+				// 协程结束时，务必将状态重置为 0，允许下一次触发
+				defer atomic.StoreInt32(&m.isDecaying, 0)
+
+				m.EpochDecayAndSnapshot()
+			}()
+		} else {
+			// 如果走到这里，说明上一个衰减还没跑完，本次触发被平滑丢弃，保护 CPU！
+			// fmt.Println("[heatLSM] 衰减太频繁，本次触发已丢弃")
+		}
+	}
+}
+
 // SearchLeaf 根据输入的 Key 查找其所属的叶子节点（注意用的是迭代，这样避免了锁的竞争，提高了高并发行能）
 // Key: 完整的 Key（绝对路径）
 // needAddSample: 是否需要增加样本
@@ -471,6 +642,33 @@ func (n *HeatNode) SearchLeaf(key Key, isRead bool, m *HeatmapManager) *HeatNode
 		current = nextChild
 		searchSuffix = remainingKey
 	}
+}
+
+func (hm *HeatmapManager) IsHotKey(key Key) bool {
+	// 1. 无锁获取当前最新的热区快照 (极速)
+	zones := hm.hotZonesSnapshot.Load().([]HotZone)
+	if len(zones) == 0 {
+		return false
+	}
+	// 2. 二分查找：寻找第一个 End > key 的区间
+	idx := sort.Search(len(zones), func(i int) bool {
+		// End 为 nil 或长度为 0 代表正无穷大
+		if len(zones[i].End) == 0 {
+			return true
+		}
+		return bytes.Compare(zones[i].End, key) > 0
+	})
+
+	// 3. 校验该区间是否真的包含这个 key
+	if idx < len(zones) {
+		start := zones[idx].Start
+		// 既然 End > key 已经满足，只要 key >= Start，就说明命中了！
+		if len(start) == 0 || bytes.Compare(key, start) >= 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // =========================================================================

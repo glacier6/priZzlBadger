@@ -8,3 +8,4 @@ zzlCode/*.vlog
 zzlCode/DISCARD
 zzlCode/KEYREGISTRY
 zzlCode/MANIFEST
+zzlTestHeatLsm/zzl_badger_data_debug

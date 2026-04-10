@@ -544,10 +544,10 @@ func (db *DB) Close() error {
 		err = db.close()
 	})
 	// zzlHACK:
-	defer func() {
-		db.zzlHeatmap.Print()
-		db.zzlTracker.PrintTopK(100)
-	}()
+	// defer func() {
+	// 	db.zzlHeatmap.Print()
+	// 	db.zzlTracker.PrintTopK(100)
+	// }()
 	// zzlHACK:END
 	return err
 }
@@ -1088,6 +1088,9 @@ func (db *DB) ensureRoomForWrite() error {
 		// We manage to push this task. Let's modify imm.
 		db.imm = append(db.imm, db.mt) // 将当前的满的memtable转换为immemtable放到immemtable数组中
 		db.mt, err = db.newMemTable()  // 创建一个新的memtable，来接受新的写入请求
+		// zzlHACK:计一次memtable写入
+		db.zzlHeatmap.OnMemtableFlush()
+		// zzlHACK:END
 		if err != nil {
 			return y.Wrapf(err, "cannot create new mem table")
 		}
@@ -2161,6 +2164,26 @@ func (db *DB) LevelsToString() string {
 			h(li.Size), h(li.TargetSize), li.Score, li.Adjusted, h(li.StaleDatSize),
 			h(li.TargetFileSize)))
 	}
+	// zzlHACK:输出热层的情况
+	if db.lc != nil && db.lc.hotTier != nil {
+		db.lc.hotTier.RLock()
+		hotNum := len(db.lc.hotTier.tables)
+		var hotSize int64
+		var hotStale uint32
+
+		for _, t := range db.lc.hotTier.tables {
+			hotSize += t.Size()
+			hotStale += t.StaleDataSize()
+		}
+		db.lc.hotTier.RUnlock()
+
+		// 完美复刻上面的打印格式，复用 h() 转换格式，容量展示为无穷大 (∞)
+		b.WriteString(fmt.Sprintf(
+			"Level 99 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
+				" StaleData: %s Target FileSize: ∞\n",
+			hotNum, h(hotSize), h(int64(hotStale))))
+	}
+	// zzlHACK:END
 	b.WriteString("Level Done\n")
 	return b.String()
 }
