@@ -2507,6 +2507,11 @@ func (s *levelsController) getLevelInfo() []LevelInfo {
 		result[i].IsBaseLevel = t.baseLevel == i
 	}
 	for _, p := range prios {
+		// zzlHACK:4800 更改输出，适配pickCompactLevels会输出98和99层
+		if p.level > 6 {
+			continue
+		}
+		// zzlHACK:END
 		result[p.level].Score = p.score
 		result[p.level].Adjusted = p.adjusted
 	}
