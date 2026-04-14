@@ -445,6 +445,12 @@ func applyManifestChange(build *Manifest, tc *pb.ManifestChange) error {
 			KeyID:       tc.KeyId,
 			Compression: options.CompressionType(tc.Compression),
 		}
+		// zzlHACK:4803 清单文件的更改适配hot层
+		if tc.Level == 98 || tc.Level == 99 {
+			build.Creations++
+			return nil // 直接返回！绝不去执行下面的切片扩容！
+		}
+		// zzlHACK:END
 		for len(build.Levels) <= int(tc.Level) { // 这行可以新增清单文件内的层级结构，一直增加到当前改变的那一个层级
 			build.Levels = append(build.Levels, levelManifest{make(map[uint64]struct{})})
 		}
@@ -455,6 +461,13 @@ func applyManifestChange(build *Manifest, tc *pb.ManifestChange) error {
 		if !ok {
 			return fmt.Errorf("MANIFEST removes non-existing table %d", tc.Id)
 		}
+		// zzlHACK:4803 清单文件的更改适配hot层
+		if tm.Level == 98 || tm.Level == 99 {
+			delete(build.Tables, tc.Id) // 只从核心 Map 中删除
+			build.Deletions++
+			return nil
+		}
+		// zzlHACK:END
 		delete(build.Levels[tm.Level].Tables, tc.Id)
 		delete(build.Tables, tc.Id)
 		build.Deletions++

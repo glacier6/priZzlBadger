@@ -62,7 +62,7 @@ func (s *levelHandler) initTables(tables []*table.Table) {
 		s.addSize(t)
 	}
 
-	if s.level == 0 {
+	if s.level == 0 || s.level == 98 { // zzlHACK:4800 同步98层
 		//0层KEY范围将重叠。只需按文件ID升序排序
 		//因为较新的表位于级别0的末尾。
 		sort.Slice(s.tables, func(i, j int) bool {
@@ -138,9 +138,22 @@ func (s *levelHandler) replaceTables(toDel, toAdd []*table.Table) error {
 
 	// Assign tables.
 	s.tables = newTables
-	sort.Slice(s.tables, func(i, j int) bool { //对目标层最终的SST切片进行排序
-		return y.CompareKeys(s.tables[i].Smallest(), s.tables[j].Smallest()) < 0
-	})
+	// zzlHACK:注意修改L98的SST顺序！
+	if s.level == 98 {
+		// 缓冲层必须按 FileID (时间) 排序，保证越新的数据越靠后,即按照ID从小到大排序
+		sort.Slice(s.tables, func(i, j int) bool {
+			return s.tables[i].ID() < s.tables[j].ID()
+		})
+	} else {
+		// 主树和 L99 有序层按 Key 排序
+		sort.Slice(s.tables, func(i, j int) bool {
+			return y.CompareKeys(s.tables[i].Smallest(), s.tables[j].Smallest()) < 0
+		})
+	}
+	// sort.Slice(s.tables, func(i, j int) bool { //对目标层最终的SST切片进行排序
+	// 	return y.CompareKeys(s.tables[i].Smallest(), s.tables[j].Smallest()) < 0
+	// })
+	// zzlHACK:END
 	s.Unlock()             // s.Unlock before we DecrRef tables -- that can be slow.
 	return decrRefs(toDel) //减少引用，以便于将旧的SST删除掉
 }
@@ -241,7 +254,7 @@ func (s *levelHandler) getTableForKey(key []byte) ([]*table.Table, func() error)
 	s.RLock() //上锁
 	defer s.RUnlock()
 
-	if s.level == 0 { //0层的特殊结构（可重叠），特殊处理，将0层所有的SST句柄返回
+	if s.level == 0 || s.level == 98 { //0层的特殊结构（可重叠），特殊处理，将0层所有的SST句柄返回 zzlHACK:4802 增加98层的重叠SST判断
 		// For level 0, we need to check every table. Remember to make a copy as s.tables may change
 		// once we exit this function, and we don't want to lock s.tables while seeking in tables.
 		// CAUTION: Reverse the tables.
@@ -321,7 +334,7 @@ func (s *levelHandler) appendIterators(iters []y.Iterator, opt *IteratorOptions)
 	if opt.Reverse {
 		topt = table.REVERSED
 	}
-	if s.level == 0 {
+	if s.level == 0 || s.level == 98 { // zzlHACK:4800 同步98层可重叠的SST
 		// Remember to add in reverse order!
 		// The newer table at the end of s.tables should be added first as it takes precedence.
 		// Level 0 tables are not in key sorted order, so we need to consider them one by one.

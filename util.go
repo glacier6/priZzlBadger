@@ -23,12 +23,25 @@ func (s *levelsController) validate() error {
 			return y.Wrap(err, "Levels Controller")
 		}
 	}
+	// zzlHACK:4800 初始化时判断SST的有效性
+	if s.hotTier != nil {
+		if err := s.hotTier.validate(); err != nil {
+			return y.Wrap(err, "Levels Controller")
+		}
+	}
+
+	if s.hotTierOrd != nil {
+		if err := s.hotTierOrd.validate(); err != nil {
+			return y.Wrap(err, "Levels Controller")
+		}
+	}
+	// zzlHACK:END
 	return nil
 }
 
 // Check does some sanity check on one level of data or in-memory index.
 func (s *levelHandler) validate() error {
-	if s.level == 0 {
+	if s.level == 0 || s.level == 98 { // zzlHACK:4800 同步98层
 		return nil
 	}
 

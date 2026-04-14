@@ -36,6 +36,51 @@ import (
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 
+// zzlHACK:4804 跟踪合并代码
+// var (
+// 	ZzlTraceMap = make(map[string][]string)
+// 	ZzlTraceMu  sync.Mutex
+// )
+
+// // ZzlTrace 记录目标 Key 的命运
+// func ZzlTrace(key []byte, format string, args ...interface{}) {
+// 	pureKey := string(y.ParseKey(key))
+// 	// 为了节省内存，我们只追踪热点 Key
+// 	if !strings.HasPrefix(pureKey, "hot_key_") {
+// 		return
+// 	}
+
+// 	msg := fmt.Sprintf(format, args...)
+
+// 	ZzlTraceMu.Lock()
+// 	ZzlTraceMap[pureKey] = append(ZzlTraceMap[pureKey], msg)
+// 	// 每个 Key 最多保留最近 100 条命运轨迹
+// 	if len(ZzlTraceMap[pureKey]) > 100 {
+// 		ZzlTraceMap[pureKey] = ZzlTraceMap[pureKey][50:]
+// 	}
+// 	ZzlTraceMu.Unlock()
+// }
+
+// // ZzlDumpTrace 在崩溃时打印案发经过
+// func ZzlDumpTrace(keyStr string) {
+// 	ZzlTraceMu.Lock()
+// 	defer ZzlTraceMu.Unlock()
+// 	fmt.Printf("\n====================================================\n")
+// 	fmt.Printf("🔍 案发经过回放: [%s]\n", keyStr)
+// 	fmt.Printf("====================================================\n")
+// 	history := ZzlTraceMap[keyStr]
+// 	if len(history) == 0 {
+// 		fmt.Println("没有任何轨迹记录...")
+// 	} else {
+// 		for i, msg := range history {
+// 			fmt.Printf("%3d. %s\n", i+1, msg)
+// 		}
+// 	}
+// 	fmt.Printf("====================================================\n\n")
+// }
+
+// zzlHACK:END
+
 var (
 	badgerPrefix = []byte("!badger!")       // Prefix for internal keys used by badger.
 	txnKey       = []byte("!badger!txn")    // For indicating end of entries in txn.
@@ -2165,23 +2210,42 @@ func (db *DB) LevelsToString() string {
 			h(li.TargetFileSize)))
 	}
 	// zzlHACK:输出热层的情况
-	if db.lc != nil && db.lc.hotTier != nil {
+	if db.lc != nil && db.lc.hotTier != nil && db.lc.hotTierOrd != nil {
+		// ==========================
+		// 1. 安全读取 L98 的信息
+		// ==========================
 		db.lc.hotTier.RLock()
 		hotNum := len(db.lc.hotTier.tables)
 		var hotSize int64
 		var hotStale uint32
-
 		for _, t := range db.lc.hotTier.tables {
 			hotSize += t.Size()
 			hotStale += t.StaleDataSize()
 		}
 		db.lc.hotTier.RUnlock()
 
+		// ==========================
+		// 2. 安全读取 L99 的信息
+		// ==========================
+		db.lc.hotTierOrd.RLock()
+		hotOrdNum := len(db.lc.hotTierOrd.tables)
+		var hotOrdSize int64
+		var hotOrdStale uint32
+		for _, t := range db.lc.hotTierOrd.tables {
+			hotOrdSize += t.Size()
+			hotOrdStale += t.StaleDataSize()
+		}
+		db.lc.hotTierOrd.RUnlock()
+
 		// 完美复刻上面的打印格式，复用 h() 转换格式，容量展示为无穷大 (∞)
+		b.WriteString(fmt.Sprintf(
+			"Level 98 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
+				" StaleData: %s Target FileSize: ∞\n",
+			hotNum, h(hotSize), h(int64(hotStale))))
 		b.WriteString(fmt.Sprintf(
 			"Level 99 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
 				" StaleData: %s Target FileSize: ∞\n",
-			hotNum, h(hotSize), h(int64(hotStale))))
+			hotOrdNum, h(hotOrdSize), h(int64(hotOrdStale))))
 	}
 	// zzlHACK:END
 	b.WriteString("Level Done\n")

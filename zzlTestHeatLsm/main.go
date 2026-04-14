@@ -1,115 +1,224 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"time"
 
-	// 注意：这里确保你的 go.mod 已经用 replace 指向了你本地魔改过的 badger 目录
 	badger "github.com/dgraph-io/badger/v4"
 )
 
+// 内存真理账本
+var truthMap = make(map[string]string)
+
 func main() {
-	// 每次测试前清理一下旧数据，保证环境纯净
+	rand.Seed(time.Now().UnixNano())
 	dbPath := "./zzl_badger_data_debug"
 	os.RemoveAll(dbPath)
 
-	fmt.Println(">>> 1. 正在初始化 BadgerDB (开启极限小 Memtable 模式)...")
-	// 开启极限模式：MemTableSize 设为 1MB (原版是 64MB)
-	// 目的：随便写几万条数据就能疯狂触发 Flush，瞬间激活热力图快照！
+	fmt.Println("=====================================================")
+	fmt.Println("🚀 启动 HeatLSM 地狱级数据一致性测试")
+	fmt.Println("=====================================================")
+
+	// ==========================================
+	// 1. 初始化数据库 (制造频繁 Flush 的恶劣环境)
+	// ==========================================
 	opt := badger.DefaultOptions(dbPath).
-		WithMemTableSize(1 << 20).    // Memtable 大小缩到 1MB
-		WithBaseTableSize(1 << 20).   // L1 的目标文件大小也缩到 1MB
-		WithValueThreshold(32 << 10). // 💥 核心修复：把 Value 阈值压缩到 32KB！(远小于 150KB)
-		WithNumLevelZeroTables(1).    // L0 只要出现 1 个表，立刻触发向下压实！
+		WithMemTableSize(1 << 20). // 1MB，极速撑爆
+		WithBaseTableSize(1 << 20).
+		WithValueThreshold(32 << 10). // 缩小阈值，让大KV也参与流转
+		WithNumLevelZeroTables(1).    // 只要有1个L0表就触发合并
 		WithNumMemtables(5).
 		WithSyncWrites(false).
-		WithLogger(nil) // 调试时嫌吵可以关掉底层日志
+		WithLogger(nil)
 
 	db, err := badger.Open(opt)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("❌ 数据库打开失败: %v", err)
 	}
-	defer db.Close()
 
-	hotKey := []byte("usertable:user_super_hot")
+	// ==========================================
+	// 2. 混沌写入阶段 (Chaos Writes)
+	// 包含新增、疯狂修改(培养热点)、以及删除
+	// ==========================================
+	fmt.Println("\n>>> [阶段 1] 混沌写入与热点培养中 (制造数十万版本冲突)...")
 
-	// =================================================================
-	// 🎯 【第一阶段：疯狂覆写，培养热点】
-	// =================================================================
-	fmt.Println(">>> 2. 开始注入热点流量，培养热点...")
-	// 💡 调试建议：在 heatLSM 的 AddSample 和 OnMemtableFlush 处打断点
-	for i := 0; i < 80000; i++ {
-		err = db.Update(func(txn *badger.Txn) error {
-			// 故意把 value 写大一点，加速 Memtable 撑爆
-			val := []byte(fmt.Sprintf("hot_value_data_payload_%010d_padding_padding", i))
-			return txn.Set(hotKey, val)
-		})
-		if err != nil {
-			log.Fatal(err)
+	const totalOps = 1500000
+	const hotKeyCount = 500     // 只有50个热点Key，被疯狂覆写
+	const coldKeyCount = 200000 // 两万个冷数据，做背景干扰
+
+	for i := 0; i < totalOps; i++ {
+		isHot := rand.Intn(100) < 80 // 80% 的概率写热点数据
+
+		var keyStr string
+		if isHot {
+			keyStr = fmt.Sprintf("hot_key_%04d", rand.Intn(hotKeyCount))
+		} else {
+			keyStr = fmt.Sprintf("cold_key_%08d", rand.Intn(coldKeyCount))
+		}
+
+		key := []byte(keyStr)
+
+		// 10% 的概率进行删除测试
+		if rand.Intn(100) < 10 {
+			err = db.Update(func(txn *badger.Txn) error {
+				return txn.Delete(key)
+			})
+			if err != nil {
+				log.Fatalf("❌ 删除失败: %v", err)
+			}
+			delete(truthMap, keyStr) // 同步删除真理账本
+		} else {
+			// 写入操作，Value 必须携带严格的 Version 标记，用于防范幽灵读
+			valStr := fmt.Sprintf("value_payload_version_%d_data_%s", i, stringsRepeat("A", 128))
+			err = db.Update(func(txn *badger.Txn) error {
+				return txn.Set(key, []byte(valStr))
+			})
+			if err != nil {
+				log.Fatalf("❌ 写入失败: %v", err)
+			}
+			truthMap[keyStr] = valStr // 同步更新真理账本
+		}
+
+		if i%500000 == 0 {
+			fmt.Printf("   ... 已执行 %d 次操作，等待后台 L98/L99 合并...\n", i)
+			time.Sleep(1 * time.Second) // 故意停顿，给后台 compaction 制造竞态机会
 		}
 	}
 
-	// =================================================================
-	// 🎯 【第二阶段：等待快照生成】
-	// =================================================================
-	fmt.Println(">>> 3. 流量注入完毕，等待 Flush 和热点快照生成 (2秒)...")
-	// 💡 调试建议：在 EpochDecayAndSnapshot 的 traverse 递归函数里打断点
-	// 看看绝对路径是怎么拼接并塞进 newZones 的！
+	fmt.Printf("   ✅ 写入完成！当前真理账本有效 Key 数量: %d\n", len(truthMap))
+	fmt.Println("   ... 强制等待 2 秒，让所有冷热数据下沉至 L98/L99/BaseLevel ...")
 	time.Sleep(2 * time.Second)
 
-	// =================================================================
-	// 🎯 【第三阶段：冷热混合写入，触发 L0 拦截】
-	// =================================================================
-	fmt.Println(">>> 4. 开始混合写入，触发底层 L0 -> L99 拦截分流...")
-	// 此时系统应该已经判定 hotKey 是热点了。
-	// 我们写一堆冷数据，中间夹杂着 hotKey，把它们逼进压缩流程 (Compaction)
-	for i := 0; i < 30000; i++ {
-		db.Update(func(txn *badger.Txn) error {
-			if i%10 == 0 {
-				return txn.Set(hotKey, []byte("the_ultimate_hot_value"))
-			}
-			coldKey := []byte(fmt.Sprintf("usertable:user_cold_%d", i))
-			return txn.Set(coldKey, []byte("cold"))
-		})
-	}
-
-	// 等待后台的 compactBuildTables 把数据刷进 Level 99
-	// 💡 调试建议：去 levels.go 的 compactBuildTables 函数里，
-	// 找到 if s.hotTier != nil && s.heatmapManager.IsHotKey(...) 的地方打断点！
-	// 亲眼看着你的热数据是怎么被塞进 hotBuilder 的。
-	time.Sleep(3 * time.Second)
-
-	// =================================================================
-	// 🎯 【第四阶段：联合读取测试】
-	// =================================================================
-	fmt.Println(">>> 5. 开始验证从 Level 99 读取最新数据...")
-	// 💡 调试建议：去 levels.go 的 get 函数和 getHotTier 函数里打断点！
-	// 看看请求是怎么精准命中 Level 99 并早停返回的。
+	// ==========================================
+	// 3. 全库点查校验 (Point-Lookup Check)
+	// ==========================================
+	fmt.Println("\n>>> [阶段 2] 全库点查一致性校验 (防范旧版本遮蔽与数据丢失)...")
 	err = db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(hotKey)
-		if err != nil {
-			return err
+		for keyStr, expectedVal := range truthMap {
+			item, err := txn.Get([]byte(keyStr))
+			if err != nil {
+				return fmt.Errorf("致命错误: Key [%s] 在真理账本中存在，但 DB 中丢失! Error: %v", keyStr, err)
+			}
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			if string(val) != expectedVal {
+				return fmt.Errorf("致命冲突 (幽灵读): Key [%s]\n期望值: %s\n实际读到: %s", keyStr, expectedVal, string(val))
+			}
+			// fmt.Printf("   ✅ 查询完成！ %s\n", keyStr)
 		}
-		val, err := item.ValueCopy(nil)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("✅ 成功读取到热点数据！Value: %s\n", string(val))
 		return nil
 	})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("❌ 点查校验失败: %v", err)
+	}
+	fmt.Println("   ✅ 全库点查 100% 匹配，无任何数据丢失或幽灵读！")
+
+	// ==========================================
+	// 4. 全库范围迭代校验 (Iterator Check)
+	// 测试 appendIteratorsReversed 的多路归并是否正常
+	// ==========================================
+	fmt.Println("\n>>> [阶段 3] 全库迭代器一致性校验 (验证 L98/L99 Iterator 挂载)...")
+	dbKeyCount := 0
+	err = db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			keyStr := string(item.Key())
+
+			// 只校验我们的测试数据
+			if !bytes.HasPrefix(item.Key(), []byte("hot_key_")) && !bytes.HasPrefix(item.Key(), []byte("cold_key_")) {
+				continue
+			}
+
+			dbKeyCount++
+			expectedVal, exists := truthMap[keyStr]
+			if !exists {
+				item, err := txn.Get([]byte(keyStr))
+				itemV, err := item.ValueCopy(nil)
+				if err != nil {
+					return fmt.Errorf("Iterator 扫到了被删除的，但点查Key [%s] 确实查不到，value[%s] 为 Error: %v", keyStr, string(itemV), err)
+				}
+				fmt.Printf("点查也查出来 Key [%s]，value [%s]", keyStr, string(itemV))
+				// badger.ZzlDumpTrace(keyStr)
+				return fmt.Errorf("致命错误: Iterator 扫到了被删除的脏数据 (未被压实或墓碑失效): [%s]", keyStr)
+			}
+
+			val, _ := item.ValueCopy(nil)
+			if string(val) != expectedVal {
+				return fmt.Errorf("致命冲突 (迭代器读到旧版本): Key [%s]\n期望值: %s\n实际读到: %s", keyStr, expectedVal, string(val))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("❌ 迭代器校验失败: %v", err)
 	}
 
-	// =================================================================
-	// 🎯 【第五阶段：大盘检阅】
-	// =================================================================
-	fmt.Println("\n>>> 6. 最终 LSM 树物理大盘：")
-	// 期待在这里看到 Level 99 [H] 里面有几十 MB 的数据！
+	if dbKeyCount != len(truthMap) {
+		log.Fatalf("❌ 致命错误: 迭代器扫描到的数量 (%d) 与 真理账本数量 (%d) 不匹配！", dbKeyCount, len(truthMap))
+	}
+	fmt.Println("   ✅ 迭代器扫描 100% 匹配，多路归并排序完全正确！")
+
+	// 打印一下当前的物理大盘，记录关机前的状态
+	fmt.Println("\n📊 关机前 LSM 树物理大盘：")
 	fmt.Println(db.LevelsToString())
 
-	// 如果需要，也可以调用你的打印树的方法
-	// db.lc.heatmapManager.Print()
+	// ==========================================
+	// 5. 关机重启校验 (Durability / Manifest Check)
+	// 这是最容易翻车的地方，验证你的 Manifest 拦截逻辑
+	// ==========================================
+	fmt.Println("\n>>> [阶段 4] 模拟服务器重启 (验证 Manifest 重放与内存恢复)...")
+	db.Close()
+	fmt.Println("   ... 数据库已安全关闭，正在从磁盘重新挂载 ...")
+
+	dbReopened, err := badger.Open(opt)
+	if err != nil {
+		log.Fatalf("❌ 重启失败，Manifest 解析可能发生越界或 Panic: %v", err)
+	}
+	defer dbReopened.Close()
+	fmt.Println("   ✅ 数据库重启成功，无越界 Panic！")
+
+	fmt.Println("\n>>> [阶段 5] 重启后终极点查校验...")
+	err = dbReopened.View(func(txn *badger.Txn) error {
+		for keyStr, expectedVal := range truthMap {
+			item, err := txn.Get([]byte(keyStr))
+			if err != nil {
+				return fmt.Errorf("重启后数据丢失: [%s]", keyStr)
+			}
+			val, _ := item.ValueCopy(nil)
+			if string(val) != expectedVal {
+				return fmt.Errorf("重启后读到旧版本: [%s]\n期望: %s\n实际: %s", keyStr, expectedVal, string(val))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("❌ 重启后校验失败: %v", err)
+	}
+
+	fmt.Println("   ✅ 重启后数据 100% 完好无损，HotTier 完美复原！")
+
+	fmt.Println("\n🎉🎉🎉 恭喜！所有极限一致性测试全部通过！HeatLSM 架构坚如磐石！ 🎉🎉🎉")
+
+	fmt.Println("\n📊 重启后 LSM 树物理大盘 (检查 L98/L99 是否挂载成功)：")
+	fmt.Println(dbReopened.LevelsToString())
+}
+
+// 辅助函数，用来快速撑大 Value，促使 MemTable 满载
+func stringsRepeat(s string, count int) string {
+	b := make([]byte, len(s)*count)
+	for i := 0; i < count; i++ {
+		copy(b[i*len(s):], s)
+	}
+	return string(b)
 }

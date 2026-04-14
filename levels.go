@@ -37,7 +37,8 @@ type levelsController struct {
 	// The following are initialized once and const.
 	levels []*levelHandler // 各层处理的把柄
 	// zzlHACK:4800 新增hotTier控制结构
-	hotTier *levelHandler
+	hotTier    *levelHandler // 98层
+	hotTierOrd *levelHandler // 99层
 	// zzlHACK:END
 	kv *DB
 
@@ -83,8 +84,12 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 		s.levels[i] = newLevelHandler(db, i) //每层一个LevelHandler，管理当前层的SSTable
 		s.cstatus.levels[i] = new(levelCompactStatus)
 	}
-	// zzlHACK:4800初始化热层
-	s.hotTier = newLevelHandler(db, 99)
+	// zzlHACK:4800初始化热层以及其合并状态对象
+	s.hotTier = newLevelHandler(db, 98)
+	s.hotTierOrd = newLevelHandler(db, 99)
+
+	s.cstatus.hotTierStatus = new(levelCompactStatus)
+	s.cstatus.hotTierOrdStatus = new(levelCompactStatus)
 	// zzlHACK:END
 
 	if db.opt.InMemory {
@@ -100,6 +105,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 	var maxFileID uint64
 	// zzlHACK:4800 新增HotTier的专属收集切片
 	var hotTables []*table.Table
+	var hotOrdTables []*table.Table
 	// zzlHACK:END
 
 	// We found that using 3 goroutines allows disk throughput to be utilized to its max.
@@ -166,12 +172,14 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 			mu.Lock()
 			//-- tables[tf.Level] = append(tables[tf.Level], t)
 			// zzlHACK:4800 初始化hotTier的hotTables
-			if tf.Level == 99 {
-				// 如果是从 Manifest 读出来的热点文件，放进专区
-				hotTables = append(hotTables, t)
-			} else if int(tf.Level) < db.opt.MaxLevels {
+			if int(tf.Level) < db.opt.MaxLevels {
 				// 原版逻辑：L0 ~ L6 正常放进官方数组
 				tables[tf.Level] = append(tables[tf.Level], t)
+			} else if tf.Level == 98 {
+				// 如果是从 Manifest 读出来的热点文件，放进专区
+				hotTables = append(hotTables, t)
+			} else if tf.Level == 99 {
+				hotOrdTables = append(hotOrdTables, t)
 			} else {
 				db.opt.Errorf("发现未知层级文件: Level %d", tf.Level)
 			}
@@ -193,6 +201,10 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 	if len(hotTables) > 0 {
 		s.hotTier.initTables(hotTables)
 		db.opt.Infof("成功从磁盘恢复了 %d 个热点 SSTable 到 HotTier！", len(hotTables))
+	}
+	if len(hotOrdTables) > 0 {
+		s.hotTierOrd.initTables(hotOrdTables)
+		db.opt.Infof("成功从磁盘恢复了 %d 个热点 SSTable 到 hotTierOrd！", len(hotOrdTables))
 	}
 	// zzlHACK:END
 
@@ -233,6 +245,18 @@ func (s *levelsController) cleanupLevels() error {
 			firstErr = err
 		}
 	}
+	// zzlHACK:4800 levelsController关闭时也触发关闭hot层
+	if s.hotTier != nil {
+		if err := s.hotTier.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.hotTierOrd != nil {
+		if err := s.hotTierOrd.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	// zzlHACK:END
 	return firstErr
 }
 
@@ -286,6 +310,8 @@ func (s *levelsController) dropTree() (int, error) {
 // tables who only have keys with this prefix are quickly dropped. The ones which have other keys
 // are run through MergeIterator and compacted to create new tables. All the mechanisms of
 // compactions apply, i.e. level sizes and MANIFEST are updated as in the normal flow.
+//
+//	zzlHACK:4800 注意下面这个函数是批量删除某一个公共前缀的KEY值，heatLSM测试用不到，不用改
 func (s *levelsController) dropPrefixes(prefixes [][]byte) error {
 	opt := s.kv.opt
 	// Iterate levels in the reverse order because if we were to iterate from
@@ -522,6 +548,26 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 		return false
 	}
 
+	// zzlHACK:3号协程负责99层冷数据下放，而所有协程都可以做98层的碎片整理（通过下面的runOnce函数）
+	tryHotTierOrdEviction := func() {
+		s.hotTierOrd.RLock()
+		size := s.hotTierOrd.totalSize
+		s.hotTierOrd.RUnlock()
+
+		// 假设 L99 超过 50MB 则触发驱逐
+		if size > (50 << 20) { // zzlTODO:还需要更改为动态的大小！
+			targets := s.levelTargets()
+			p := compactionPriority{
+				level: 99,
+				t:     targets,
+			}
+			s.kv.opt.Infof("HotTier L99 is full (%d MB), triggering eviction to L%d\n",
+				size/(1<<20), targets.baseLevel)
+			run(p)
+		}
+	}
+	// zzlHACK:END
+
 	var priosBuffer []compactionPriority // 合并优先级数组
 	runOnce := func() bool {
 		prios := s.pickCompactLevels(priosBuffer) // NOTE: 核心操作，计算出当前的 待压缩层 切片，里面包含哪些层目前需要压缩，且按优先级（adjusted）顺序排序
@@ -558,6 +604,7 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 	}
 
 	count := 0                                      // 专用于2号合并协程的计数器，达到200执行tryLmaxToLmaxCompaction
+	hotCount := 0                                   // 3号协程专用计数器 zzlHACK:4803
 	ticker := time.NewTicker(50 * time.Millisecond) //创建一个50ms的时钟
 	defer ticker.Stop()
 	for { //无限循环
@@ -569,6 +616,9 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 			if s.kv.opt.LmaxCompaction && id == 2 && count >= 200 { // 注意只有2号协程才会执行底层自我合并的操作，且每10秒才会执行一次这个操作（LmaxCompaction参数控制这个功能是否开启）
 				tryLmaxToLmaxCompaction() //执行最底层自我合并
 				count = 0
+			} else if id == 3 && hotCount >= 100 { // zzlHACK:4803 多一个else if，让3号协程专门处理99层冷数据下放，所有协程都可以处理98-99层的碎片整理
+				tryHotTierOrdEviction()
+				hotCount = 0
 			} else {
 				runOnce() //其余的进行普通的压缩
 			}
@@ -682,6 +732,23 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 		}
 	}
 	prios = out
+	// zzlHACK:4803 加入HotTier层的碎片整理任务
+	if s.hotTier != nil {
+		s.hotTier.RLock()
+		l98Count := len(s.hotTier.tables)
+		s.hotTier.RUnlock()
+
+		// 触发阈值：当 L98 的碎文件达到一定数量 (比如 10 个)
+		if l98Count >= 10 { // zzlTODO:动态或者再想想决定这个数量
+			prios = append(prios, compactionPriority{
+				level:    98,
+				score:    2.0,   // 给个及格分数即可
+				adjusted: 999.0, // 霸道特权：赋予极高的调整分数，确保它在接下来的排序中稳居全局第一！
+				t:        t,     // 携带当前的 target 统计信息
+			})
+		}
+	}
+	// zzlHACK:END
 
 	// Sort by the adjusted score.
 	// 按调整分数排序
@@ -693,12 +760,24 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 
 // checkOverlap checks if the given tables overlap with any level from the given "lev" onwards.
 // checkOverlap检查给定的table是否与给定“lev”之后的任何级别重叠。
-func (s *levelsController) checkOverlap(tables []*table.Table, lev int) bool {
+func (s *levelsController) checkOverlap(tables []*table.Table, lev int, currentLev int, baseLevel int) bool {
 	kr := getKeyRange(tables...)
 	for i, lh := range s.levels {
-		if i < lev { // Skip upper levels.
+		// zzlHACK:4803 修复L98-L99 checkOverlap 错误丢弃墓碑 (导致旧数据复活)
+		if lev >= 98 {
+			// 如果是 L98/L99 的压缩，必须去检查主树（从 BaseLevel 往下）是否有更老的数据
+			if i < baseLevel {
+				continue
+			}
+		} else if i < lev {
+			// 原生逻辑：跳过上层
 			continue
 		}
+		// if i < lev { // Skip upper levels.
+		// 	continue
+		// }
+		// zzlHACK:END
+
 		lh.RLock()
 		left, right := lh.overlappingTables(levelHandlerRLocked{}, kr)
 		lh.RUnlock()
@@ -706,6 +785,33 @@ func (s *levelsController) checkOverlap(tables []*table.Table, lev int) bool {
 			return true
 		}
 	}
+	// zzlHACK:4803 如果是L0层向下合并，那么就还需要额外判断hot层的重叠情况，注意98-99的在上面那里已经做过处理了
+	if currentLev == 0 {
+		if s.hotTier != nil {
+			s.hotTier.RLock()
+			hasOverlap := false
+			for _, t := range s.hotTier.tables {
+				tkr := getKeyRange(t)
+				if tkr.overlapsWith(kr) {
+					hasOverlap = true
+					break
+				}
+			}
+			s.hotTier.RUnlock()
+			if hasOverlap {
+				return true // 在 L98 发现了旧版本，墓碑必须保留！
+			}
+		}
+		if s.hotTierOrd != nil {
+			s.hotTierOrd.RLock()
+			left, right := s.hotTierOrd.overlappingTables(levelHandlerRLocked{}, kr)
+			s.hotTierOrd.RUnlock()
+			if right-left > 0 {
+				return true // 在 L99 发现了旧版本，墓碑必须保留！
+			}
+		}
+	}
+	// zzlHACK:END
 	return false
 }
 
@@ -739,7 +845,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 			bopts := buildTableOptions(s.kv)
 			// 热点文件大小，我们可以直接复用 L1 的大小
-			bopts.TableSize = uint64(cd.t.fileSz[1])
+			bopts.TableSize = uint64(cd.t.fileSz[1]) // zzlTODO:改HOT层文件大小
 
 			var tbl *table.Table
 			if s.kv.opt.InMemory {
@@ -750,7 +856,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			}
 
 			if err == nil {
-				hotRes <- tbl // 发送到热通道！
+				hotRes <- tbl // 将刷入磁盘的SST信息发送到热通道！
 			}
 		}(bToFlush, s.reserveFileID())
 	}
@@ -758,8 +864,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 	// Check overlap of the top level with the levels which are not being
 	// compacted in this compaction.
-	hasOverlap := s.checkOverlap(cd.allTables(), cd.nextLevel.level+1) //覆盖度检查，检查两层中受影响的SST（即top + bot）的总范围是否与更底层之间有重叠
-
+	hasOverlap := s.checkOverlap(cd.allTables(), cd.nextLevel.level+1, cd.thisLevel.level, cd.t.baseLevel) //覆盖度检查，检查两层中受影响的SST（即top + bot）的总范围是否与更底层之间有重叠 zzlHACK:4803追加传入当前层级以及baseLevel
 	// Pick a discard ts, so we can discard versions below this ts. We should
 	// never discard any versions starting from above this timestamp, because
 	// that would affect the snapshot view guarantee provided by transactions.
@@ -789,6 +894,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 	// 这有助于避免在Li生成与Li+1有巨大重叠的表。
 	exceedsAllowedOverlap := func(kr keyRange) bool {
 		n2n := cd.nextLevel.level + 1
+		// 注意下面这个不需要加 或n2n >= 98 因为 n2n >= 98 时 必定 n2n >= len(s.levels)
 		if n2n <= 1 || n2n >= len(s.levels) {
 			return false
 		}
@@ -877,6 +983,15 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 			vs := it.Value()
 			version := y.ParseTs(it.Key())
+			// zzlHACK:4804 跟踪探针
+			// isTombstone := (vs.Meta & 1) > 0 // bitDelete 是 1
+			// kind := "有效数据"
+			// if isTombstone {
+			// 	kind = "💀 墓碑"
+			// }
+			// ZzlTrace(it.Key(), "【合并扫描】发现 %s (Ver: %d), 正在 L%d -> L%d 途中",
+			// 	kind, version, cd.thisLevel.level, cd.nextLevel.level)
+			// zzlHACK:END
 
 			isExpired := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
 
@@ -924,6 +1039,8 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 					default:
 						// If no overlap, we can skip all the versions, by continuing here.
 						// 如果没有重叠，我们可以跳过所有版本
+						// ZzlTrace(it.Key(), "【彻底销毁】%s (Ver: %d) 被丢弃! 原因: isExpired/Deleted=[%v], hasOverlap=[%v], lastValid=[%v]",
+						// 	kind, version, isExpired, lastValidVersion, hasOverlap, lastValidVersion) // zzlHACK:4804 跟踪探针
 						numSkips++
 						updateStats(vs) // 将当前跳过的KV对，更新到脏键统计中
 						continue        // 跳过
@@ -956,8 +1073,8 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			var targetBuilder *table.Builder
 			isHot := false
 
-			// 只有 L0 合并时，才触发热度拦截
-			if cd.thisLevel.level == 0 {
+			// 只有 L0 向下合并时，才触发热度拦截
+			if cd.thisLevel.level == 0 && cd.nextLevel.level != 0 {
 				pureKey := y.ParseKey(it.Key())
 				isHot = s.hotTier.db.zzlHeatmap.IsHotKey(pureKey)
 			}
@@ -966,7 +1083,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 				// 走向热点传送带
 				if hotBuilder == nil {
 					bopts := buildTableOptions(s.kv)
-					bopts.TableSize = uint64(cd.t.fileSz[1])
+					bopts.TableSize = uint64(cd.t.fileSz[1]) // zzlTODO:更改目标SST大小
 					hotBuilder = table.NewTableBuilder(bopts)
 				}
 				targetBuilder = hotBuilder
@@ -978,10 +1095,13 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			// 统一执行写入（保留了 Badger 原版的过期判断逻辑）
 			switch {
 			case firstKeyHasDiscardSet:
+				// ZzlTrace(it.Key(), "【落地】%s (Ver: %d) 作为过期历史装入 Builder (Hot: %v)", kind, version, isHot) // zzlHACK:4804 跟踪探针
 				targetBuilder.AddStaleKey(it.Key(), vs, vp.Len)
 			case isExpired:
+				// ZzlTrace(it.Key(), "【落地】%s (Ver: %d) 作为墓碑装入 Builder (Hot: %v)", kind, version, isHot) // zzlHACK:4804 跟踪探针
 				targetBuilder.AddStaleKey(it.Key(), vs, vp.Len)
 			default:
+				// ZzlTrace(it.Key(), "【落地】%s (Ver: %d) 作为有效数据装入 Builder (Hot: %v)", kind, version, isHot) // zzlHACK:4804 跟踪探针
 				targetBuilder.Add(it.Key(), vs, vp.Len)
 			}
 
@@ -1011,7 +1131,17 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		bopts := buildTableOptions(s.kv) //得到新建SST的一些配置项
 		// Set TableSize to the target file size for that level.
 		// 将TableSize设置为该级别的目标文件大小。
-		bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
+		// zzlHACK:4803 修复 nextLevel=99 时的数组越界
+		// bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
+		if cd.nextLevel.level == 98 || cd.nextLevel.level == 99 {
+			// L98 和 L99 是热点层，文件大小我们直接复用 L1 层的基准大小即可
+			bopts.TableSize = uint64(cd.t.fileSz[1]) // zzlTODO:思考设置多大的SST大小
+		} else {
+			// 正常的 L0-L6 走原生逻辑
+			bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
+		}
+		// zzlHACK:END
+
 		builder := table.NewTableBuilder(bopts) // NOTE:依照SST配置项创建一个生成SST的builder,里面会有加密等相关操作
 
 		// This would do the iteration and add keys to builder.
@@ -1070,7 +1200,8 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 // compactBuildTables merges topTables and botTables to form a list of new tables.
 // compactBuildTables合并topTables和botTables以形成新表列表。
 func (s *levelsController) compactBuildTables( // 进行压缩，并得到两层间合并后的新tables（是只包含会受影响的SST，而不会把目标层的所有SST都在其中）
-	lev int, cd compactDef) ([]*table.Table, []*table.Table, func() error, error) { // zzlHACK:增加一个[]*table.Table,代表是hotier的SST表
+	lev int, cd compactDef) ([]*table.Table, []*table.Table, func() error, error) {
+	// zzlHACK:增加一个[]*table.Table,代表是hotier的SST表
 	// lev是当前层的层号
 	topTables := cd.top
 	botTables := cd.bot
@@ -1108,7 +1239,7 @@ func (s *levelsController) compactBuildTables( // 进行压缩，并得到两层
 		// Create iterators across all the tables involved first.
 		var iters []y.Iterator
 		switch {
-		case lev == 0: //如果当前层是L0，特殊处理当前层涉及的SST
+		case lev == 0 || lev == 98: //如果当前层是L0，特殊处理当前层涉及的SST zzlHACK:4803 加一个 或98
 			iters = appendIteratorsReversed(iters, topTables, table.NOCACHE)
 		case len(topTables) > 0: // 处理当前层选到的那个唯一的SST
 			y.AssertTrue(len(topTables) == 1)
@@ -1207,8 +1338,8 @@ func buildChangeSet(cd *compactDef, newTables []*table.Table, hotTables []*table
 	// zzlHACK:4801 追加hottier的改变记录
 	for _, table := range hotTables {
 		changes = append(changes,
-			// 注意看！这里的层级被死死钉在了 99（HotTier 特权层）
-			newCreateChange(table.ID(), 99, table.KeyID(), table.CompressionType()))
+			// 注意看！这里的层级被死死钉在了 98（HotTier 特权层）
+			newCreateChange(table.ID(), 98, table.KeyID(), table.CompressionType()))
 	}
 	// zzlHACK:END
 	for _, table := range cd.top {
@@ -1275,7 +1406,7 @@ type compactDef struct {
 	span *otrace.Span
 
 	compactorId int
-	t           targets
+	t           targets // 存储基线层以及各层目标大小和文件大小
 	p           compactionPriority
 	thisLevel   *levelHandler //溢出层（当前层）
 	nextLevel   *levelHandler //目标层
@@ -1499,6 +1630,142 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 	}
 	return s.cstatus.compareAndAdd(thisAndNextLevelRLocked{}, *cd) //compareAndAdd这个函数记录全局的合并状态，会返回是否可以执行此合并任务
 }
+
+// zzlHACK:4803 专门为 98层 (Hot-Unordered) 定制的选表逻辑
+// 物理逻辑完全对标 L0 -> Lbase，安全处理重叠范围与并发锁
+func (s *levelsController) fillTablesL98(cd *compactDef) bool {
+	// 确保目标层绝对不能是 0 (我们的目标层是 99)
+	if cd.nextLevel.level == 0 {
+		panic("Target level for L98 compaction can't be zero.")
+	}
+
+	// 1. 极其重要：使用 Badger 原生的双层并发锁，代替我们自己手写的 RLock
+	// 这会安全地锁住 cd.thisLevel (L98) 和 cd.nextLevel (L99)
+	cd.lockLevels()
+	defer cd.unlockLevels()
+
+	top := cd.thisLevel.tables // 获取 L98 所有的碎片表
+	if len(top) == 0 {
+		return false
+	}
+
+	var out []*table.Table
+	if len(cd.dropPrefixes) > 0 {
+		// 如果是执行 dropPrefix (删库)，全量带走
+		out = top
+	} else {
+		var kr keyRange
+		// 2. 完美复刻 L0 的“子范围圈地”逻辑
+		// top[0] 是 L98 中最旧的碎片文件。我们从它开始，把所有与它范围相连的碎片全捞出来。
+		// 一旦遇到完全断开的 SSTable 就 break，防止本次合并范围拉得过大，阻塞其他协程。
+		for _, t := range top {
+			dkr := getKeyRange(t)
+			// 注意：如果 kr 为空，overlapsWith 默认返回 true
+			if kr.overlapsWith(dkr) {
+				out = append(out, t) // 累计这个碎片
+				kr.extend(dkr)       // 撑大合并范围
+			} else {
+				// 遇到范围不连续的碎片，立即停止圈地。剩下的碎片留给下一次合并任务！
+				break
+			}
+		}
+	}
+
+	// 计算本次圈出的 L98 碎片的整体边界
+	cd.thisRange = getKeyRange(out...)
+	cd.top = out
+
+	// 3. 寻找 L99 (有序层) 的受害者
+	// L99 是全局有序的，可以直接用 overlappingTables 用二分查找极速切出重叠的底表
+	left, right := cd.nextLevel.overlappingTables(levelHandlerRLocked{}, cd.thisRange)
+	cd.bot = make([]*table.Table, right-left)
+	copy(cd.bot, cd.nextLevel.tables[left:right])
+
+	// 4. 确定下一层的锁定范围
+	if len(cd.bot) == 0 {
+		// 如果 L99 刚好在这个范围是空的，那范围就是 L98 的范围
+		cd.nextRange = cd.thisRange
+	} else {
+		// 如果 L99 有数据，必须以 L99 真实受影响的数据边界为准
+		cd.nextRange = getKeyRange(cd.bot...)
+	}
+
+	// 5. 提交给全局状态机进行并发仲裁！
+	// 如果此时有其他协程正在动 cd.nextRange 这块地盘，compareAndAdd 会返回 false 放弃合并
+	return s.cstatus.compareAndAdd(thisAndNextLevelRLocked{}, *cd)
+}
+
+// zzlHACK:4803 专用于 99 层的冷数据驱逐器
+// 完美复刻 Badger 原生 Ln -> Ln+1 的单表精准驱逐逻辑，支持极致并发
+func (s *levelsController) fillTablesL99(cd *compactDef) bool {
+	// 1. 获取双层原生安全锁
+	cd.lockLevels()
+	defer cd.unlockLevels()
+
+	tables := make([]*table.Table, len(cd.thisLevel.tables))
+	copy(tables, cd.thisLevel.tables)
+	if len(tables) == 0 {
+		return false
+	}
+
+	// 2. 借用原生启示：按数据的“陈旧程度”排序
+	// 这一步对于 L99 简直完美！它会把最久没更新的老文件排在前面，
+	// 保证我们优先驱逐的是已经“降温”的数据，而不是刚刚合并进去的真热点。
+	s.sortByHeuristic(tables, cd)
+
+	// 3. 遍历排序后的表，寻找最佳驱逐对象
+	for _, t := range tables {
+		cd.thisSize = t.Size()
+		cd.thisRange = getKeyRange(t)
+
+		// [并发防线 1]：如果 L99 的这块区域正在被别的协程操作（比如 L98 正在往这里合并）
+		// 直接跳过这个表，找下一个！绝不阻塞！
+		if s.cstatus.overlapsWith(cd.thisLevel.level, cd.thisRange) {
+			continue
+		}
+
+		// 💥 架构师抉择：放弃贪心，每次只下放 1 个表！
+		// 为什么不像之前那样一次挑 3 个？
+		// 因为每次下放 1 个表，对底层 BaseLevel 造成的 Key 范围重叠是最小的（Blast Radius 最小）。
+		// 这样既能快速完成驱逐，又能把 BaseLevel 的并发空间留给其他协程。
+		cd.top = []*table.Table{t}
+
+		// 4. 去主树的 BaseLevel 寻找将被覆盖的受害者
+		left, right := cd.nextLevel.overlappingTables(levelHandlerRLocked{}, cd.thisRange)
+
+		cd.bot = make([]*table.Table, right-left)
+		copy(cd.bot, cd.nextLevel.tables[left:right])
+
+		// 5. 极端好运的情况：BaseLevel 里完全没有重叠
+		if len(cd.bot) == 0 {
+			cd.bot = []*table.Table{}
+			cd.nextRange = cd.thisRange
+			if !s.cstatus.compareAndAdd(thisAndNextLevelRLocked{}, *cd) {
+				continue
+			}
+			return true
+		}
+
+		cd.nextRange = getKeyRange(cd.bot...)
+
+		// [并发防线 2]：如果 BaseLevel 的这块区域正在被主树的其他协程压缩
+		// 跳过这个表，换一个地盘驱逐！
+		if s.cstatus.overlapsWith(cd.nextLevel.level, cd.nextRange) {
+			continue
+		}
+
+		// [并发防线 3]：终极原子注册
+		if !s.cstatus.compareAndAdd(thisAndNextLevelRLocked{}, *cd) {
+			continue
+		}
+		return true // 成功抢到一个驱逐任务，返回交给协程去干活！
+	}
+
+	// 如果遍历完了所有的表，发现它们全都在被别的协程占用，或者没有合适的
+	return false
+}
+
+// zzlHACK:END
 
 // fillTablesL0 would try to fill tables from L0 to be compacted with Lbase. If
 // it can not do that, it would try to compact tables from L0 -> L0.
@@ -1734,7 +2001,9 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	// 表永远不应该在级别之间直接移动，
 	// 始终重写以允许丢弃无效版本。
 
-	newTables, hotTables, decr, err := s.compactBuildTables(l, cd) //NOTE:核心操作，进行压缩（已经写到磁盘了），并得到两层间合并后的新tables，decr是一个执行函数，其会把newTables内的每个SST的引用计数减1 zzlHACK:4801 多一个返回参数
+	newTables, hotTables, decr, err := s.compactBuildTables(l, cd) //NOTE:核心操作，进行压缩（已经写到磁盘了），并得到两层间合并后的新tables，decr是一个执行函数，其会把newTables内的每个SST的引用计数减1 zzlHACK:4801 多一个返回参数hotTables
+	// 注意此时这个newTables和hotTables还没有和普通层和Hot层关联，他只是写到磁盘了
+
 	if err != nil {
 		return err
 	}
@@ -1838,9 +2107,6 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	if err := nextLevel.replaceTables(cd.bot, newTables); err != nil { //把目标层老的tables删除掉，并替换成新的表
 		return err
 	}
-	if err := thisLevel.deleteTables(cd.top); err != nil { //把当前层老的tables删除掉
-		return err
-	}
 	// zzlHACK:4801挂载在内存
 	if len(hotTables) > 0 {
 		// replaceTables(old, new)，我们传入空的 old，就等价于追加 new
@@ -1849,6 +2115,9 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 		}
 	}
 	// zzlHACK:END
+	if err := thisLevel.deleteTables(cd.top); err != nil { //把当前层老的tables删除掉
+		return err
+	}
 
 	// Note: For level 0, while doCompact is running, it is possible that new tables are added.
 	// However, the tables are added only to the end, so it is ok to just delete the first table.
@@ -1893,9 +2162,13 @@ var errFillTables = stderrors.New("Unable to fill tables")
 // doCompact picks some table on level l and compacts it away to the next level.
 // doCompact在l层拾取一些表并将其压缩到下一层。id是压缩协程的id
 func (s *levelsController) doCompact(id int, p compactionPriority) error {
-	l := p.level                         // l层是已溢出要压缩的层（或者是最后一层）
-	y.AssertTrue(l < s.kv.opt.MaxLevels) // Sanity check.
-	if p.t.baseLevel == 0 {              //得到基线层号
+	l := p.level // l层是已溢出要压缩的层（或者是最后一层）
+	// zzlHACK:4803 适配hot层
+	if l != 98 && l != 99 {
+		y.AssertTrue(l < s.kv.opt.MaxLevels) // 原生的 Sanity check
+	}
+	// zzlHACK:END
+	if p.t.baseLevel == 0 { // 得到基线层号，这一步只是避免有错
 		p.t = s.levelTargets()
 	}
 
@@ -1903,11 +2176,11 @@ func (s *levelsController) doCompact(id int, p compactionPriority) error {
 	defer span.End()
 
 	cd := compactDef{ //形成合并任务对象
-		compactorId:  id, //完成该任务的协程ID
-		span:         span,
-		p:            p,
-		t:            p.t,         // 用于筛选目标层
-		thisLevel:    s.levels[l], // 当前层（溢出层）
+		compactorId: id, //完成该任务的协程ID
+		span:        span,
+		p:           p,
+		t:           p.t, // 用于筛选目标层
+		// thisLevel:    s.levels[l], // 当前层（溢出层） zzlHACK:4803 不在这里设置，在下面那个if里面设
 		dropPrefixes: p.dropPrefixes,
 	}
 
@@ -1924,11 +2197,27 @@ func (s *levelsController) doCompact(id int, p compactionPriority) error {
 		// 这里做的是为了减少写放大以及空间放大，进行跳层合并
 		// 即如果数据库为空的时候，会从0-6依次进行合并，那么L0层的数据可能会合并6次到6层，而这个跳层合并就解决了这个问题，从L0层直接倒序合并，先与Lbase合并
 		// Lbase是根据从顶部开始的非空的第一层来选择的（检查L1到L6），即若是全空的话会先与最底层L6合并
+		cd.thisLevel = s.levels[l] // zzlHACK:4803 在这里设置当前层对象
 		cd.nextLevel = s.levels[p.t.baseLevel]
 		if !s.fillTablesL0(&cd) { // NOTE:核心操作，L0 -> L0，L0 -> BASE，填充合并任务对象内的一些参数，且将当前合并任务记录到s.cstatus(注意每次只会增加一个合并任务，即找到能合并的，就直接记录并返回了)
 			return errFillTables
 		}
+		// zzlHACK:4803 增加hotTier选表逻辑
+	} else if l == 98 {
+		cd.thisLevel = s.hotTier
+		cd.nextLevel = s.hotTierOrd
+		if !s.fillTablesL98(&cd) { // 调用自定义的选表锁定函数
+			return errFillTables
+		}
+	} else if l == 99 {
+		cd.thisLevel = s.hotTierOrd
+		cd.nextLevel = s.levels[p.t.baseLevel] // 驱逐目标：主树的基准层 (BaseLevel)
+		if !s.fillTablesL99(&cd) {
+			return errFillTables
+		}
+		// zzlHACK:END
 	} else { //如果溢出的是非0层，最后一层选择自身作为目标层，其余层选择比溢出层低一层的层级作为目标层
+		cd.thisLevel = s.levels[l] // zzlHACK:4803 在这里设置当前层对象
 		cd.nextLevel = cd.thisLevel
 		// We're not compacting the last level so pick the next level.
 		if !cd.thisLevel.isLastLevel() {
@@ -2042,16 +2331,18 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 		if err != nil {
 			return y.ValueStruct{}, y.Wrapf(err, "get key: %q", key)
 		}
-		if vs.Value == nil && vs.Meta == 0 {
-			continue
+		// zzlHACK:4802 确定修改，原版的是在L0找不到就立马查下一层了，这样会导致完全不去查Hot层！！
+		if !(vs.Value == nil && vs.Meta == 0) {
+			// 如果查到，注意如果是删除标记也会进入到这里
+			y.NumBytesReadsLSMAdd(s.kv.opt.MetricsEnabled, int64(len(vs.Value))) //统计信息
+			if vs.Version == version {                                           //如果找到的版本与当前事务的版本（readTs）相同，直接返回结果
+				return vs, nil
+			}
+			if maxVs.Version < vs.Version {
+				maxVs = vs
+			}
 		}
-		y.NumBytesReadsLSMAdd(s.kv.opt.MetricsEnabled, int64(len(vs.Value))) //统计信息
-		if vs.Version == version {                                           //如果找到的版本与当前事务的版本（readTs）相同，直接返回结果
-			return vs, nil
-		}
-		if maxVs.Version < vs.Version {
-			maxVs = vs
-		}
+		// zzlHACK:END
 		// zzlHACK:4802 HotTier 联合探测,在L0层查过之后
 		if h.level == 0 && s.hotTier != nil {
 			vsHot, err := s.getHotTier(key)
@@ -2077,42 +2368,35 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 	return maxVs, nil
 }
 
-// zzlHACK:4802 HotTier 专属倒序扫描器
+// zzlHACK:4802 HotTier 专属倒序扫描器，会扫描98层（无序层）和99层（order层）
+// zzlHACK: 双缓冲层联合热点查询
 func (s *levelsController) getHotTier(key []byte) (y.ValueStruct, error) {
-	var maxVs y.ValueStruct
-
-	s.hotTier.RLock()
-	defer s.hotTier.RUnlock()
-	hash := y.Hash(y.ParseKey(key))
-	// 核心架构哲学：从最新的 SSTable 开始往回搜 (切片索引越大的，越晚加入，数据越新)
-	for i := len(s.hotTier.tables) - 1; i >= 0; i-- {
-		t := s.hotTier.tables[i]
-
-		// 1. 布隆过滤器防线：极速排异，避免无意义的磁盘 I/O
-		if t.DoesNotHave(hash) {
-			continue
-		}
-
-		// 2. 迭代器精确查找
-		it := t.NewIterator(0) // 0 表示 NOCACHE
-		it.Seek(key)
-
-		// 验证迭代器是否有效，并且 Key 是否完全匹配
-		if it.Valid() && y.SameKey(key, it.Key()) {
-			curVs := it.Value()
-			curVs.Version = y.ParseTs(it.Key())
-
-			// 拿到数据后进行版本对决
-			if maxVs.Version < curVs.Version {
-				// 把 Value 从底层的 Block 缓存中硬拷贝出来，彻底切断物理联系！
-				curVs.Value = y.SafeCopy(nil, curVs.Value)
-				maxVs = curVs
-			}
-		}
-		it.Close() // 极其重要：务必关闭迭代器防止内存/句柄泄漏
+	// ==========================================
+	// 第一防线：查 L98 (无序缓冲层)
+	// 原生底层知道 L98 允许重叠，会自动提取所有碎片表并找出最新 Version
+	// 原生底层会自动处理引用计数(decr)和安全拷贝(ValueCopy)
+	// ==========================================
+	vs, err := s.hotTier.get(key)
+	if err != nil {
+		return y.ValueStruct{}, err
 	}
 
-	return maxVs, nil
+	// Badger 中如果没找到数据，ValueStruct 的 Version 会是 0
+	if vs.Version > 0 {
+		return vs, nil // 极速逃逸：在缓冲层找到了绝对最新值！
+	}
+
+	// ==========================================
+	// 第二防线：L98 没找到，查 L99 (有序基准层)
+	// 原生底层知道 L99 不重叠，会自动使用 O(log N) 二分查找锁定唯一表！
+	// ==========================================
+	vsOrd, errOrd := s.hotTierOrd.get(key)
+	if errOrd != nil {
+		return y.ValueStruct{}, errOrd
+	}
+
+	// 如果 L99 找到了就返回，没找到自然返回空的 vsOrd (Version=0)
+	return vsOrd, nil
 }
 
 // zzlHACK:END
@@ -2131,8 +2415,19 @@ func (s *levelsController) appendIterators(
 	iters []y.Iterator, opt *IteratorOptions) []y.Iterator {
 	// Just like with get, it's important we iterate the levels from 0 on upward, to avoid missing
 	// data when there's a compaction.
-	for _, level := range s.levels { //遍历每一层增加
+	for i, level := range s.levels { //遍历每一层增加
 		iters = level.appendIterators(iters, opt) //NOTE:核心操作
+		// zzlHACK:4802 范围查询的补丁 确保迭代器数组中的优先级严格保持：L0 > L98 > L99 > L1 > L2...
+		if i == 0 {
+			if s.hotTier != nil {
+				iters = s.hotTier.appendIterators(iters, opt)
+			}
+
+			if s.hotTierOrd != nil {
+				iters = s.hotTierOrd.appendIterators(iters, opt)
+			}
+		}
+		// zzlHACK:END
 	}
 	return iters
 }

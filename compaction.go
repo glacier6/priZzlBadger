@@ -155,20 +155,44 @@ type compactStatus struct {
 	sync.RWMutex
 	levels []*levelCompactStatus
 	tables map[uint64]struct{} // 正在合并的tables
+
+	// zzlHACK:增加HOT层的合并状态
+	hotTierStatus    *levelCompactStatus
+	hotTierOrdStatus *levelCompactStatus
+	// zzlHACK:END
 }
+
+// zzlHACK:4803 管理合并状态的安全获取层级状态的路由函数
+func (cs *compactStatus) getLevelStatus(level int) *levelCompactStatus {
+	if level == 98 {
+		if cs.hotTierStatus == nil {
+			cs.hotTierStatus = new(levelCompactStatus)
+		}
+		return cs.hotTierStatus
+	}
+	if level == 99 {
+		if cs.hotTierOrdStatus == nil {
+			cs.hotTierOrdStatus = new(levelCompactStatus)
+		}
+		return cs.hotTierOrdStatus
+	}
+	return cs.levels[level]
+}
+
+// zzlHACK:END
 
 func (cs *compactStatus) overlapsWith(level int, this keyRange) bool {
 	cs.RLock()
 	defer cs.RUnlock()
 
-	thisLevel := cs.levels[level]
+	thisLevel := cs.getLevelStatus(level) // zzlHACK:4803 适配管理合并状态的层级获取
 	return thisLevel.overlapsWith(this)
 }
 
 func (cs *compactStatus) delSize(l int) int64 {
 	cs.RLock()
 	defer cs.RUnlock()
-	return cs.levels[l].delSize
+	return cs.getLevelStatus(l).delSize // zzlHACK:4803 适配管理合并状态的层级获取
 }
 
 type thisAndNextLevelRLocked struct{}
@@ -180,10 +204,15 @@ func (cs *compactStatus) compareAndAdd(_ thisAndNextLevelRLocked, cd compactDef)
 	cs.Lock()
 	defer cs.Unlock()
 
-	tl := cd.thisLevel.level
-	y.AssertTruef(tl < len(cs.levels), "Got level %d. Max levels: %d", tl, len(cs.levels))
-	thisLevel := cs.levels[cd.thisLevel.level]
-	nextLevel := cs.levels[cd.nextLevel.level]
+	// zzlHACK:注释掉原生的 AssertTruef 越界断言！
+	// tl := cd.thisLevel.level
+	// y.AssertTruef(tl < len(cs.levels), "Got level %d. Max levels: %d", tl, len(cs.levels))
+	// thisLevel := cs.levels[cd.thisLevel.level]
+	// nextLevel := cs.levels[cd.nextLevel.level]
+	// 使用安全路由获取交警锁
+	thisLevel := cs.getLevelStatus(cd.thisLevel.level)
+	nextLevel := cs.getLevelStatus(cd.nextLevel.level)
+	// zzlHACK:END
 
 	if thisLevel.overlapsWith(cd.thisRange) {
 		return false
@@ -209,11 +238,15 @@ func (cs *compactStatus) delete(cd compactDef) {
 	cs.Lock()
 	defer cs.Unlock()
 
-	tl := cd.thisLevel.level
-	y.AssertTruef(tl < len(cs.levels), "Got level %d. Max levels: %d", tl, len(cs.levels))
-
-	thisLevel := cs.levels[cd.thisLevel.level]
-	nextLevel := cs.levels[cd.nextLevel.level]
+	// zzlHACK:4803 注释掉原生的 AssertTruef 越界断言！
+	tl := cd.thisLevel.level // 这个还需要打开，因为下面的打印要用
+	// y.AssertTruef(tl < len(cs.levels), "Got level %d. Max levels: %d", tl, len(cs.levels))
+	// thisLevel := cs.levels[cd.thisLevel.level]
+	// nextLevel := cs.levels[cd.nextLevel.level]
+	// 使用安全路由获取交警锁
+	thisLevel := cs.getLevelStatus(cd.thisLevel.level)
+	nextLevel := cs.getLevelStatus(cd.nextLevel.level)
+	// zzlHACK:END
 
 	thisLevel.delSize -= cd.thisSize
 	found := thisLevel.remove(cd.thisRange)
