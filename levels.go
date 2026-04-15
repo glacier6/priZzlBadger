@@ -739,7 +739,7 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 		s.hotTier.RUnlock()
 
 		// 触发阈值：当 L98 的碎文件达到一定数量 (比如 10 个)
-		if l98Count >= 10 { // zzlTODO:动态或者再想想决定这个数量
+		if l98Count >= 5 { // zzlTODO:动态或者再想想决定这个数量
 			prios = append(prios, compactionPriority{
 				level:    98,
 				score:    2.0,   // 给个及格分数即可
@@ -764,29 +764,53 @@ func (s *levelsController) checkOverlap(tables []*table.Table, lev int, currentL
 	kr := getKeyRange(tables...)
 	for i, lh := range s.levels {
 		// zzlHACK:4803 修复L98-L99 checkOverlap 错误丢弃墓碑 (导致旧数据复活)
-		if lev >= 98 {
-			// 如果是 L98/L99 的压缩，必须去检查主树（从 BaseLevel 往下）是否有更老的数据
-			if i < baseLevel {
-				continue
-			}
-		} else if i < lev {
-			// 原生逻辑：跳过上层
+		// 原生逻辑是 if i < lev { continue }，但在双轨制下必须改变：
+		// 1. 如果是冷树内部合并 (currentLev < 98)，依然跳过自己以上的层。
+		// 2. 如果是热树合并 (currentLev >= 98)，它必须全量扫描主树的所有层 (L0~L6)，绝对不能跳过！
+		if currentLev < 98 && i < lev {
 			continue
 		}
+		lh.RLock()
+		if i != 0 {
+			// 对于 L1 ~ L6 (严格排序层)，安全使用原生二分查找 API
+			left, right := lh.overlappingTables(levelHandlerRLocked{}, kr)
+			lh.RUnlock()
+			if right-left > 0 {
+				return true // 发现旧数据，墓碑必须保留！
+			}
+		} else {
+			hasOverlap := false
+			for _, t := range lh.tables {
+				tkr := getKeyRange(t)
+				if tkr.overlapsWith(kr) {
+					hasOverlap = true
+					break
+				}
+			}
+			lh.RUnlock()
+			if hasOverlap {
+				return true // L0 发现旧数据，墓碑必须保留！
+			}
+		}
+		// zzlHACK:END
 		// if i < lev { // Skip upper levels.
 		// 	continue
 		// }
-		// zzlHACK:END
-
-		lh.RLock()
-		left, right := lh.overlappingTables(levelHandlerRLocked{}, kr)
-		lh.RUnlock()
-		if right-left > 0 {
-			return true
-		}
+		// lh.RLock()
+		// left, right := lh.overlappingTables(levelHandlerRLocked{}, kr)
+		// lh.RUnlock()
+		// if right-left > 0 {
+		// 	return true
+		// }
 	}
 	// zzlHACK:4803 如果是L0层向下合并，那么就还需要额外判断hot层的重叠情况，注意98-99的在上面那里已经做过处理了
-	if currentLev == 0 {
+	// ==========================================
+	// 阶段二：检查热树 (L98 ~ L99)
+	// ==========================================
+	// 只有主树位于汇聚点以上的层级 (L0 ~ baseLevel-1) 在压缩时，才需要查平行的热树。
+	// 如果是 L5/L6 压缩，或者热树自己内部压缩，不需要交叉检查。
+	if currentLev < baseLevel {
+		// 1. 查 L98 特区，注意L98特区和L0类似，所以不能用overlappingTables来查，而上面那个原版的完全不会进行L0层的overlappingTables（因为lev必定大于0）
 		if s.hotTier != nil {
 			s.hotTier.RLock()
 			hasOverlap := false
@@ -799,15 +823,17 @@ func (s *levelsController) checkOverlap(tables []*table.Table, lev int, currentL
 			}
 			s.hotTier.RUnlock()
 			if hasOverlap {
-				return true // 在 L98 发现了旧版本，墓碑必须保留！
+				return true // 热树里有旧数据，墓碑保留！
 			}
 		}
+
+		// 2. 查 L99 特区
 		if s.hotTierOrd != nil {
 			s.hotTierOrd.RLock()
 			left, right := s.hotTierOrd.overlappingTables(levelHandlerRLocked{}, kr)
 			s.hotTierOrd.RUnlock()
 			if right-left > 0 {
-				return true // 在 L99 发现了旧版本，墓碑必须保留！
+				return true // 热树里有旧数据，墓碑保留！
 			}
 		}
 	}
@@ -826,45 +852,13 @@ func (s *levelsController) checkOverlap(tables []*table.Table, lev int, currentL
 // 我们使用拆分同时执行单个压缩。如果在压实过程中，底层涉及>=3个表格，我们会选择关键范围将主压实拆分为子压实。
 // 每个子压缩并行运行，只在提供的键范围内迭代，生成表。这大大加快了压实速度。
 func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
-	inflightBuilders *y.Throttle, res chan<- *table.Table, hotRes chan<- *table.Table) { // zzlHACK:4801新增 hotRes chan<- *table.Table
+	inflightBuilders *y.Throttle, res chan<- *table.Table) {
 	//注意kr是当前子压缩要处理的key范围，每个子压缩处理的key范围不一样
 	//而it就是专门处理遍历的层级迭代器，其内已关联当前层与目标层涉及的各个SST
 
-	// zzlHACK:4801 独立的 HotBuilder 及其异步发车逻辑
-	// 注意冷数据是按照一轮论
-	var hotBuilder *table.Builder
-	// 定义一个专门用来把热点 Builder 刷入磁盘的闭包函数
-	flushHotBuilderAsync := func(bToFlush *table.Builder) {
-		if err := inflightBuilders.Do(); err != nil {
-			return
-		}
-		go func(b *table.Builder, fileID uint64) {
-			var err error
-			defer inflightBuilders.Done(err)
-			defer b.Close()
-
-			bopts := buildTableOptions(s.kv)
-			// 热点文件大小，我们可以直接复用 L1 的大小
-			bopts.TableSize = uint64(cd.t.fileSz[1]) // zzlTODO:改HOT层文件大小
-
-			var tbl *table.Table
-			if s.kv.opt.InMemory {
-				tbl, err = table.OpenInMemoryTable(b.Finish(), fileID, &bopts)
-			} else {
-				fname := table.NewFilename(fileID, s.kv.opt.Dir)
-				tbl, err = table.CreateTable(fname, b)
-			}
-
-			if err == nil {
-				hotRes <- tbl // 将刷入磁盘的SST信息发送到热通道！
-			}
-		}(bToFlush, s.reserveFileID())
-	}
-	// zzlHACK:END
-
 	// Check overlap of the top level with the levels which are not being
 	// compacted in this compaction.
-	hasOverlap := s.checkOverlap(cd.allTables(), cd.nextLevel.level+1, cd.thisLevel.level, cd.t.baseLevel) //覆盖度检查，检查两层中受影响的SST（即top + bot）的总范围是否与更底层之间有重叠 zzlHACK:4803追加传入当前层级以及baseLevel
+	hasOverlap := s.checkOverlap(cd.allTables(), cd.nextLevel.level+1, cd.thisLevel.level, cd.t.baseLevel) //覆盖度检查，检查两层中受影响的SST（即top + bot）的总范围是否与更底层之间有重叠 zzlHACK:4803追加传入当前层级以及baseLevel zzlTODO:更改适配FLUSH分流
 	// Pick a discard ts, so we can discard versions below this ts. We should
 	// never discard any versions starting from above this timestamp, because
 	// that would affect the snapshot view guarantee provided by transactions.
@@ -1053,64 +1047,24 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 				vp.Decode(vs.Value)
 			}
 			// NOTE:核心操作，将KV对加入新的SST。即依照当前KV的特性，分别压缩保留到不同的位置，如果下次压缩就要丢掉，那么就执行AddStaleKey，否则就执行普通的Add即可
-			// switch {
-			// case firstKeyHasDiscardSet:
-			// 	// This key is same as the last key which had "DiscardEarlierVersions" set. The
-			// 	// the next compactions will drop this key if its ts >
-			// 	// discardTs (of the next compaction).
-			// 	// 此密钥与设置了“DiscardEarlier Versions”的最后一个密钥相同。如果ts>discadTs（下一次压缩），则下一次压实将删除此键。
-			// 	builder.AddStaleKey(it.Key(), vs, vp.Len)
-			// case isExpired:
-			// 	// If the key is expired, the next compaction will drop it if
-			// 	// its ts > discardTs (of the next compaction).
-			// 	// 如果key已过期，如果其ts>discadTs（下一次压缩），则下一次压实将丢弃它。
-			// 	builder.AddStaleKey(it.Key(), vs, vp.Len)
-			// default:
-			// 	builder.Add(it.Key(), vs, vp.Len)
-			// }
-
-			// zzlHACK:4801 heatLSM 核心分流系统
-			var targetBuilder *table.Builder
-			isHot := false
-
-			// 只有 L0 向下合并时，才触发热度拦截
-			if cd.thisLevel.level == 0 && cd.nextLevel.level != 0 {
-				pureKey := y.ParseKey(it.Key())
-				isHot = s.hotTier.db.zzlHeatmap.IsHotKey(pureKey)
-			}
-
-			if isHot {
-				// 走向热点传送带
-				if hotBuilder == nil {
-					bopts := buildTableOptions(s.kv)
-					bopts.TableSize = uint64(cd.t.fileSz[1]) // zzlTODO:更改目标SST大小
-					hotBuilder = table.NewTableBuilder(bopts)
-				}
-				targetBuilder = hotBuilder
-			} else {
-				// 走向官方的冷传送带
-				targetBuilder = builder
-			}
-
-			// 统一执行写入（保留了 Badger 原版的过期判断逻辑）
 			switch {
 			case firstKeyHasDiscardSet:
+				// This key is same as the last key which had "DiscardEarlierVersions" set. The
+				// the next compactions will drop this key if its ts >
+				// discardTs (of the next compaction).
+				// 此密钥与设置了“DiscardEarlier Versions”的最后一个密钥相同。如果ts>discadTs（下一次压缩），则下一次压实将删除此键。
 				// ZzlTrace(it.Key(), "【落地】%s (Ver: %d) 作为过期历史装入 Builder (Hot: %v)", kind, version, isHot) // zzlHACK:4804 跟踪探针
-				targetBuilder.AddStaleKey(it.Key(), vs, vp.Len)
+				builder.AddStaleKey(it.Key(), vs, vp.Len)
 			case isExpired:
+				// If the key is expired, the next compaction will drop it if
+				// its ts > discardTs (of the next compaction).
+				// 如果key已过期，如果其ts>discadTs（下一次压缩），则下一次压实将丢弃它。
 				// ZzlTrace(it.Key(), "【落地】%s (Ver: %d) 作为墓碑装入 Builder (Hot: %v)", kind, version, isHot) // zzlHACK:4804 跟踪探针
-				targetBuilder.AddStaleKey(it.Key(), vs, vp.Len)
+				builder.AddStaleKey(it.Key(), vs, vp.Len)
 			default:
 				// ZzlTrace(it.Key(), "【落地】%s (Ver: %d) 作为有效数据装入 Builder (Hot: %v)", kind, version, isHot) // zzlHACK:4804 跟踪探针
-				targetBuilder.Add(it.Key(), vs, vp.Len)
+				builder.Add(it.Key(), vs, vp.Len)
 			}
-
-			// 【关键动作】：如果热点传送带满了，立刻发车！不影响冷传送带！
-			if isHot && hotBuilder.ReachedCapacity() {
-				flushHotBuilderAsync(hotBuilder)
-				hotBuilder = nil // 清空指针，下一个热点来了重新 New
-			}
-			// zzlHACK:END
 		}
 		s.kv.opt.Debugf("[%d] LOG Compact. Added %d keys. Skipped %d keys. Iteration took: %v",
 			cd.compactorId, numKeys, numSkips, time.Since(timeStart).Round(time.Millisecond))
@@ -1185,23 +1139,12 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 	}
 	s.kv.vlog.updateDiscardStats(discardStats) //把discard信息记录起来，在GC中使用
 	s.kv.opt.Debugf("Discard stats: %v", discardStats)
-	// zzlHACK:4801 heatLSM 结束清理：刷入最后的热点残余
-	if hotBuilder != nil {
-		if hotBuilder.Empty() {
-			hotBuilder.Finish()
-			hotBuilder.Close()
-		} else {
-			flushHotBuilderAsync(hotBuilder)
-		}
-	}
-	// zzlHACK:END
 }
 
 // compactBuildTables merges topTables and botTables to form a list of new tables.
 // compactBuildTables合并topTables和botTables以形成新表列表。
-func (s *levelsController) compactBuildTables( // 进行压缩，并得到两层间合并后的新tables（是只包含会受影响的SST，而不会把目标层的所有SST都在其中）
-	lev int, cd compactDef) ([]*table.Table, []*table.Table, func() error, error) {
-	// zzlHACK:增加一个[]*table.Table,代表是hotier的SST表
+func (s *levelsController) compactBuildTables(
+	lev int, cd compactDef) ([]*table.Table, func() error, error) {
 	// lev是当前层的层号
 	topTables := cd.top
 	botTables := cd.bot
@@ -1251,49 +1194,36 @@ func (s *levelsController) compactBuildTables( // 进行压缩，并得到两层
 	}
 
 	res := make(chan *table.Table, 3) //该通道用于暂存新的SST
-	// zzlHACK:4801 热图专属收集器
-	hotRes := make(chan *table.Table, 3)
-	// zzlHACK:END
 	inflightBuilders := y.NewThrottle(8 + len(cd.splits))
 	for _, kr := range cd.splits {
 		// 根据前面分的各个分组，每个分组分配一个go协程进行处理（所以对于日志合并，会有两次go协程分解，第一次就是前面那个分解为4个协程的那里，然后第二次是在这里）
 		// Initiate Do here so we can register the goroutines for buildTables too.
 		if err := inflightBuilders.Do(); err != nil { //异步操作，每遍历一次会开启一个异步协程，而每个异步协程会在此累计次数一次
 			s.kv.opt.Errorf("cannot start subcompaction: %+v", err)
-			return nil, nil, nil, err // zzlHACK:4801 加一个nil
+			return nil, nil, err
 		}
 		go func(kr keyRange) {
 			defer inflightBuilders.Done(nil)                   //异步操作，当前异步协程已完成
 			it := table.NewMergeIterator(newIterator(), false) //生成一个用于合并的迭代器 NOTE:470（在这个newIterator()函数里面，会把bot与top的所有SST关联到it上）
 			defer it.Close()
-			s.subcompact(it, kr, cd, inflightBuilders, res, hotRes) //NOTE: 核心操作，进行子任务压缩（注意分割的目标是cd.bot的SST，且按照SST数量均分到各个子任务） zzlHACK:4801 加一个hotRes参数
+			s.subcompact(it, kr, cd, inflightBuilders, res) //NOTE: 核心操作，进行子任务压缩（注意分割的目标是cd.bot的SST，且按照SST数量均分到各个子任务）
 		}(kr)
 	}
 
 	var newTables []*table.Table //存合并后新的SST
-	var hotTables []*table.Table // zzlHACK:4801 存合并后高覆写的SST
 	var wg sync.WaitGroup
-	wg.Add(2)   // zzlHACK:4801 新增一个等待
+	wg.Add(1)
 	go func() { // 这个协程专门用来接收上面各个子压缩协程压缩得到的SST结果
 		defer wg.Done()
 		for t := range res {
 			newTables = append(newTables, t) //将新的table压入累计切片
 		}
 	}()
-	// zzlHACK:4801 收集热数据
-	go func() { // 这个协程专门用来接收上面各个子压缩协程压缩得到的SST结果
-		defer wg.Done()
-		for t := range hotRes {
-			hotTables = append(hotTables, t) //将新的table压入累计切片
-		}
-	}()
-	// zzlHACK:END
 
 	// Wait for all table builders to finish and also for newTables accumulator to finish.
 	// 等待所有表生成器完成，也等待newTables累加器完成。
 	err := inflightBuilders.Finish() // 异步操作，等待所有子任务压缩完成
 	close(res)                       // 关闭通道（这个函数会在发完才关闭）
-	close(hotRes)                    // zzlHACK:4801 关闭通道（这个函数会在发完才关闭）
 	wg.Wait()                        // Wait for all tables to be picked up.等所有的tables都收拾好。
 
 	if err == nil {
@@ -1309,39 +1239,22 @@ func (s *levelsController) compactBuildTables( // 进行压缩，并得到两层
 		// An error happened.  Delete all the newly created table files (by calling DecrRef
 		// -- we're the only holders of a ref).
 		_ = decrRefs(newTables)
-		_ = decrRefs(hotTables) // zzlHACK:4801 🔥 出错时也要清理热点文件
-		return nil, nil, nil, y.Wrapf(err, "while running compactions for: %+v", cd)
+		return nil, nil, y.Wrapf(err, "while running compactions for: %+v", cd)
 	}
 
 	sort.Slice(newTables, func(i, j int) bool { //将生成的新SST切片从小到大排序
 		return y.CompareKeys(newTables[i].Biggest(), newTables[j].Biggest()) < 0
 	})
-	// zzlHACK:4801 🔥 热点文件也要排序
-	sort.Slice(hotTables, func(i, j int) bool {
-		return y.CompareKeys(hotTables[i].Biggest(), hotTables[j].Biggest()) < 0
-	})
-	return newTables, hotTables, func() error {
-		_ = decrRefs(newTables)
-		return decrRefs(hotTables)
-	}, nil
-	// return newTables, func() error { return decrRefs(newTables) }, nil
-	// zzlHACK:END
+	return newTables, func() error { return decrRefs(newTables) }, nil
 }
 
-func buildChangeSet(cd *compactDef, newTables []*table.Table, hotTables []*table.Table) pb.ManifestChangeSet {
+func buildChangeSet(cd *compactDef, newTables []*table.Table) pb.ManifestChangeSet {
 	changes := []*pb.ManifestChange{}
 	for _, table := range newTables {
 		changes = append(changes,
 			newCreateChange(table.ID(), cd.nextLevel.level, table.KeyID(), table.CompressionType()))
 		// KeyID貌似是压缩的密钥，而不是具体某个kv对的k
 	}
-	// zzlHACK:4801 追加hottier的改变记录
-	for _, table := range hotTables {
-		changes = append(changes,
-			// 注意看！这里的层级被死死钉在了 98（HotTier 特权层）
-			newCreateChange(table.ID(), 98, table.KeyID(), table.CompressionType()))
-	}
-	// zzlHACK:END
 	for _, table := range cd.top {
 		// Add a delete change only if the table is not in memory.
 		if !table.IsInmemory {
@@ -2001,7 +1914,7 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	// 表永远不应该在级别之间直接移动，
 	// 始终重写以允许丢弃无效版本。
 
-	newTables, hotTables, decr, err := s.compactBuildTables(l, cd) //NOTE:核心操作，进行压缩（已经写到磁盘了），并得到两层间合并后的新tables，decr是一个执行函数，其会把newTables内的每个SST的引用计数减1 zzlHACK:4801 多一个返回参数hotTables
+	newTables, decr, err := s.compactBuildTables(l, cd) //NOTE:核心操作，进行压缩（已经写到磁盘了），并得到两层间合并后的新tables，decr是一个执行函数，其会把newTables内的每个SST的引用计数减1
 	// 注意此时这个newTables和hotTables还没有和普通层和Hot层关联，他只是写到磁盘了
 
 	if err != nil {
@@ -2078,7 +1991,7 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	// --- 🕵️‍♂️ 详情分析结束 ---
 	// zzlHACK:END
 
-	changeSet := buildChangeSet(&cd, newTables, hotTables) //创建一个更改集，貌似只记录一些SST级的更改，不记录更具体的如具体key的一些更改 zzlHACK:4801 多传入一个hotTables
+	changeSet := buildChangeSet(&cd, newTables) //创建一个更改集，貌似只记录一些SST级的更改，不记录更具体的如具体key的一些更改
 
 	// We write to the manifest _before_ we delete files (and after we created files)
 	if err := s.kv.manifest.addChanges(changeSet.Changes); err != nil { // NOTE:核心操作，将SST级的更改信息写入清单文件，之后DB才能找到某个SST属于哪个Level
@@ -2107,14 +2020,6 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	if err := nextLevel.replaceTables(cd.bot, newTables); err != nil { //把目标层老的tables删除掉，并替换成新的表
 		return err
 	}
-	// zzlHACK:4801挂载在内存
-	if len(hotTables) > 0 {
-		// replaceTables(old, new)，我们传入空的 old，就等价于追加 new
-		if err := s.hotTier.replaceTables([]*table.Table{}, hotTables); err != nil {
-			return err
-		}
-	}
-	// zzlHACK:END
 	if err := thisLevel.deleteTables(cd.top); err != nil { //把当前层老的tables删除掉
 		return err
 	}
@@ -2264,38 +2169,40 @@ func (s *levelsController) doCompact(id int, p compactionPriority) error {
 	return nil
 }
 
-func (s *levelsController) addLevel0Table(t *table.Table) error {
-	// Add table to manifest file only if it is not opened in memory. We don't want to add a table
-	// to the manifest file if it exists only in memory.
-	if !t.IsInmemory {
-		// We update the manifest _before_ the table becomes part of a levelHandler, because at that
-		// point it could get used in some compaction.  This ensures the manifest file gets updated in
-		// the proper order. (That means this update happens before that of some compaction which
-		// deletes the table.)
-		// 我们更新manifest_before_使表成为levelHandler的一部分，因为此时它可以在某些压缩中使用。这可确保清单文件按正确的顺序更新。（这意味着此更新发生在删除表的某些压缩之前。）
-		err := s.kv.manifest.addChanges([]*pb.ManifestChange{ // 更新清单文件
-			newCreateChange(t.ID(), 0, t.KeyID(), t.CompressionType()),
-		})
-		if err != nil {
-			return err
-		}
-	}
+// zzlHACK:4801 注释掉原版增加L0Table的函数
+// func (s *levelsController) addLevel0Table(t *table.Table) error {
+// 	// Add table to manifest file only if it is not opened in memory. We don't want to add a table
+// 	// to the manifest file if it exists only in memory.
+// 	if !t.IsInmemory {
+// 		// We update the manifest _before_ the table becomes part of a levelHandler, because at that
+// 		// point it could get used in some compaction.  This ensures the manifest file gets updated in
+// 		// the proper order. (That means this update happens before that of some compaction which
+// 		// deletes the table.)
+// 		// 我们更新manifest_before_使表成为levelHandler的一部分，因为此时它可以在某些压缩中使用。这可确保清单文件按正确的顺序更新。（这意味着此更新发生在删除表的某些压缩之前。）
+// 		err := s.kv.manifest.addChanges([]*pb.ManifestChange{ // 更新清单文件
+// 			newCreateChange(t.ID(), 0, t.KeyID(), t.CompressionType()),
+// 		})
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
 
-	for !s.levels[0].tryAddLevel0Table(t) { // 更新levercontroller
-		// Before we unstall, we need to make sure that level 0 is healthy.
-		timeStart := time.Now()
-		for s.levels[0].numTables() >= s.kv.opt.NumLevelZeroTablesStall {
-			time.Sleep(10 * time.Millisecond)
-		}
-		dur := time.Since(timeStart)
-		if dur > time.Second {
-			s.kv.opt.Infof("L0 was stalled for %s\n", dur.Round(time.Millisecond))
-		}
-		s.l0stallsMs.Add(int64(dur.Round(time.Millisecond)))
-	}
+// 	for !s.levels[0].tryAddLevel0Table(t) { // 更新levercontroller
+// 		// Before we unstall, we need to make sure that level 0 is healthy.
+// 		timeStart := time.Now()
+// 		for s.levels[0].numTables() >= s.kv.opt.NumLevelZeroTablesStall {
+// 			time.Sleep(10 * time.Millisecond)
+// 		}
+// 		dur := time.Since(timeStart)
+// 		if dur > time.Second {
+// 			s.kv.opt.Infof("L0 was stalled for %s\n", dur.Round(time.Millisecond))
+// 		}
+// 		s.l0stallsMs.Add(int64(dur.Round(time.Millisecond)))
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
+// zzlHACK:END
 
 func (s *levelsController) close() error {
 	err := s.cleanupLevels()
@@ -2320,7 +2227,24 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 	// number.)
 	// 重要的是，我们从0开始向上迭代级别。原因是，如果我们以相反的顺序或并行方式迭代（天真地以某种顺序调用所有h.RLock（）），
 	// 我们可以在压缩后读取L级的表，在压缩前读取L+1级的表。（如果我们将其并行化，我们需要通过增加级别号的顺序来调用h.RLock（）函数。）
-	version := y.ParseTs(key)    //解析出版本号（当前事务的ReadTs）
+	version := y.ParseTs(key) //解析出版本号（当前事务的ReadTs）
+	// zzlHACK:4802 HotTier 联合探测,在L0层之前探测，注意未考虑startLevel这个参数
+	if s.hotTier != nil {
+		vsHot, err := s.getHotTier(key)
+		if err != nil {
+			return y.ValueStruct{}, err
+		}
+
+		if vsHot.Value != nil || vsHot.Meta != 0 {
+			if vsHot.Version == version {
+				return vsHot, nil // 特区完美命中最新版本，提前返回！
+			}
+			if maxVs.Version < vsHot.Version {
+				maxVs = vsHot // 更新当前找到的最高水位
+			}
+		}
+	}
+	// zzlHACK:END
 	for _, h := range s.levels { //遍历7（默认）层
 		// Ignore all levels below startLevel. This is useful for GC when L0 is kept in memory.
 		if h.level < startLevel {
@@ -2340,23 +2264,6 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 			}
 			if maxVs.Version < vs.Version {
 				maxVs = vs
-			}
-		}
-		// zzlHACK:END
-		// zzlHACK:4802 HotTier 联合探测,在L0层查过之后
-		if h.level == 0 && s.hotTier != nil {
-			vsHot, err := s.getHotTier(key)
-			if err != nil {
-				return y.ValueStruct{}, err
-			}
-
-			if vsHot.Value != nil || vsHot.Meta != 0 {
-				if vsHot.Version == version {
-					return vsHot, nil // 特区完美命中最新版本，提前返回！
-				}
-				if maxVs.Version < vsHot.Version {
-					maxVs = vsHot // 更新当前找到的最高水位
-				}
 			}
 		}
 		// zzlHACK:END
@@ -2415,19 +2322,17 @@ func (s *levelsController) appendIterators(
 	iters []y.Iterator, opt *IteratorOptions) []y.Iterator {
 	// Just like with get, it's important we iterate the levels from 0 on upward, to avoid missing
 	// data when there's a compaction.
-	for i, level := range s.levels { //遍历每一层增加
-		iters = level.appendIterators(iters, opt) //NOTE:核心操作
-		// zzlHACK:4802 范围查询的补丁 确保迭代器数组中的优先级严格保持：L0 > L98 > L99 > L1 > L2...
-		if i == 0 {
-			if s.hotTier != nil {
-				iters = s.hotTier.appendIterators(iters, opt)
-			}
+	// zzlHACK:4802 范围查询的补丁 确保迭代器数组中的优先级严格保持：L98 > L99 > L0 > L1 > L2...
+	if s.hotTier != nil {
+		iters = s.hotTier.appendIterators(iters, opt)
+	}
 
-			if s.hotTierOrd != nil {
-				iters = s.hotTierOrd.appendIterators(iters, opt)
-			}
-		}
-		// zzlHACK:END
+	if s.hotTierOrd != nil {
+		iters = s.hotTierOrd.appendIterators(iters, opt)
+	}
+	// zzlHACK:END
+	for _, level := range s.levels { //遍历每一层增加
+		iters = level.appendIterators(iters, opt) //NOTE:核心操作
 	}
 	return iters
 }

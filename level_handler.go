@@ -219,6 +219,24 @@ func (s *levelHandler) tryAddLevel0Table(t *table.Table) bool {
 	return true
 }
 
+// zzlHACK:4801 为 L98 (Hot Tier) 专属定制的极速无阻塞挂载函数
+func (s *levelHandler) addHotTable(t *table.Table) {
+	// 确保这是热层调用，防止其他层误用
+	y.AssertTrue(s.level >= 98)
+
+	s.Lock()
+	defer s.Unlock()
+
+	// 💥 绝对的区别：这里没有任何 Stall (阻塞) 逻辑！
+	// 只要内存没爆，只要是热数据，直接无脑塞进去，吞吐量拉满！
+
+	s.tables = append(s.tables, t)
+	t.IncrRef()
+	s.addSize(t)
+}
+
+// zzlHACK:END
+
 // This should be called while holding the lock on the level.
 func (s *levelHandler) addSize(t *table.Table) {
 	s.totalSize += t.Size()

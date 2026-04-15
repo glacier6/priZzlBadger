@@ -1152,12 +1152,73 @@ func arenaSize(opt Options) int64 {
 	return opt.MemTableSize + opt.maxBatchSize + opt.maxBatchCount*int64(skl.MaxNodeSize)
 }
 
+// zzlHACK:4801 注释掉旧版的Memtable下放L0
 // buildL0Table builds a new table from the memtable.
 // buildL0Table从memtable构建一个新表。
-func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *table.Builder {
+// func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *table.Builder {
+// 	defer iter.Close()
+
+// 	b := table.NewTableBuilder(bopts) // 构造器
+// 	for iter.Rewind(); iter.Valid(); iter.Next() {
+// 		if len(dropPrefixes) > 0 && hasAnyPrefixes(iter.Key(), dropPrefixes) {
+// 			continue
+// 		}
+// 		vs := iter.Value()
+// 		var vp valuePointer
+// 		if vs.Meta&bitValuePointer > 0 {
+// 			vp.Decode(vs.Value)
+// 		}
+// 		b.Add(iter.Key(), iter.Value(), vp.Len) // 往SST构造器里面加入memtable的key
+// 	}
+
+// 	return b
+// }
+
+// handleMemTableFlush must be run serially.
+// handleMemTableFlush必须连续运行。handleMemTableFlush是做将memtable中的数据刷入磁盘L0层操作的函数
+// func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
+// 	bopts := buildTableOptions(db)           //创建一个表配置
+// 	itr := mt.sl.NewUniIterator(false)       //根据memtalbe内容创建一个迭代器
+// 	builder := buildL0Table(itr, nil, bopts) //NOTE:核心操作，buildL0Table以immemtable为基础的迭代器中构建一个新表的构造器（里面已经包含memtalbe的各个kv对）。
+// 	defer builder.Close()
+
+// 	// buildL0Table can return nil if the none of the items in the skiplist are
+// 	// added to the builder. This can happen when drop prefix is set and all
+// 	// the items are skipped.
+// 	// 如果skiplist中的所有项目都没有添加到table builder中，buildL0Table可以返回nil。当设置了删除前缀并跳过所有项目时，可能会出现这种情况。
+// 	if builder.Empty() {
+// 		builder.Finish()
+// 		return nil
+// 	}
+
+// 	fileID := db.lc.reserveFileID() // 得到LSM树的文件ID,注意这个ID是Badger内部定义的ID，还没有创建ID对应的文件
+// 	var tbl *table.Table
+// 	var err error
+// 	if db.opt.InMemory {
+// 		data := builder.Finish()
+// 		tbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
+// 	} else {
+// 		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder) //NOTE:从创建器中真正创建SST，table.NewFilename(fileID, db.opt.Dir)得到的是文件路径+文件名
+// 	}
+// 	if err != nil {
+// 		return y.Wrap(err, "error while creating table")
+// 	}
+// 	// We own a ref on tbl.
+// 	err = db.lc.addLevel0Table(tbl) // 将当前创建的表对象加到到levelcontroler的第0层以及更新清单文件（注意在上面那个CreateTable函数内就已经写入磁盘了，这里只是让levelcontroler得知新增的SST）
+// 	_ = tbl.DecrRef()               // Releases our ref.
+// 	return err
+// }
+// zzlHACK:END
+
+// 💥 zzlHACK:4801 将原版 buildL0Table 改造为双路构建器
+// buildFlushTables 从 memtable 构建冷热两个新表。
+func buildFlushTables(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options, db *DB) (*table.Builder, *table.Builder) {
 	defer iter.Close()
 
-	b := table.NewTableBuilder(bopts) // 构造器
+	// 准备两辆大巴车
+	coldBuilder := table.NewTableBuilder(bopts)
+	hotBuilder := table.NewTableBuilder(bopts)
+
 	for iter.Rewind(); iter.Valid(); iter.Next() {
 		if len(dropPrefixes) > 0 && hasAnyPrefixes(iter.Key(), dropPrefixes) {
 			continue
@@ -1167,46 +1228,162 @@ func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *
 		if vs.Meta&bitValuePointer > 0 {
 			vp.Decode(vs.Value)
 		}
-		b.Add(iter.Key(), iter.Value(), vp.Len) // 往SST构造器里面加入memtable的key
-	}
 
-	return b
+		// 解析出 pureKey 用于热度查询 (去除时间戳)
+		pureKey := y.ParseKey(iter.Key())
+
+		// 💥 命运的分流点！
+		// 注意：这里的 heatmapSnapshot 是你在调用前获取的定格快照，保证全过程一致性
+		if db.zzlHeatmap.IsHotKey(pureKey) {
+			hotBuilder.Add(iter.Key(), iter.Value(), vp.Len) // 热数据上 L98 大巴
+		} else {
+			coldBuilder.Add(iter.Key(), iter.Value(), vp.Len) // 冷数据上 L0 大巴
+		}
+	}
+	return coldBuilder, hotBuilder
 }
 
-// handleMemTableFlush must be run serially.
-// handleMemTableFlush必须连续运行。handleMemTableFlush是做将memtable中的数据刷入磁盘L0层操作的函数
+// 💥 zzlHACK:4801 改造原版 Flush 逻辑，支持双轨落盘
 func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
-	bopts := buildTableOptions(db)           //创建一个表配置
-	itr := mt.sl.NewUniIterator(false)       //根据memtalbe内容创建一个迭代器
-	builder := buildL0Table(itr, nil, bopts) //NOTE:核心操作，buildL0Table以immemtable为基础的迭代器中构建一个新表的构造器（里面已经包含memtalbe的各个kv对）。
-	defer builder.Close()
+	bopts := buildTableOptions(db)
+	itr := mt.sl.NewUniIterator(false)
 
-	// buildL0Table can return nil if the none of the items in the skiplist are
-	// added to the builder. This can happen when drop prefix is set and all
-	// the items are skipped.
-	// 如果skiplist中的所有项目都没有添加到table builder中，buildL0Table可以返回nil。当设置了删除前缀并跳过所有项目时，可能会出现这种情况。
-	if builder.Empty() {
-		builder.Finish()
+	// 1. 获取当前周期定格的热力图快照 (防止 Flush 中途热度变化导致物理撕裂)
+	// (你需要替换成你实际获取快照的代码)
+	// snapshot := db.zzlHeatmap.GetLastSnapshot()
+
+	// 2. 调用双路构建器
+	coldBuilder, hotBuilder := buildFlushTables(itr, dropPrefixes, bopts, db)
+	defer coldBuilder.Close()
+	defer hotBuilder.Close()
+
+	// 3. 如果全都跳过了，直接返回
+	if coldBuilder.Empty() && hotBuilder.Empty() {
+		coldBuilder.Finish()
+		hotBuilder.Finish()
 		return nil
 	}
 
-	fileID := db.lc.reserveFileID() // 得到LSM树的文件ID,注意这个ID是Badger内部定义的ID，还没有创建ID对应的文件
-	var tbl *table.Table
+	var coldTbl, hotTbl *table.Table
 	var err error
-	if db.opt.InMemory {
-		data := builder.Finish()
-		tbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
+
+	// ==========================================
+	// 4A. 处理冷数据大巴 (落入 L0)
+	// ==========================================
+	if !coldBuilder.Empty() {
+		fileID := db.lc.reserveFileID() // 给 L0 文件申请一个 ID
+		if db.opt.InMemory {
+			data := coldBuilder.Finish()
+			coldTbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
+		} else {
+			coldTbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), coldBuilder)
+		}
+		if err != nil {
+			return y.Wrap(err, "error while creating L0 cold table")
+		}
 	} else {
-		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder) //NOTE:从创建器中真正创建SST，table.NewFilename(fileID, db.opt.Dir)得到的是文件路径+文件名
+		coldBuilder.Finish()
 	}
-	if err != nil {
-		return y.Wrap(err, "error while creating table")
+
+	// ==========================================
+	// 4B. 处理热数据大巴 (落入 L98)
+	// ==========================================
+	if !hotBuilder.Empty() {
+		fileID := db.lc.reserveFileID() // 给 L98 文件额外申请一个 ID
+		if db.opt.InMemory {
+			data := hotBuilder.Finish()
+			hotTbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
+		} else {
+			hotTbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), hotBuilder)
+		}
+		if err != nil {
+			return y.Wrap(err, "error while creating L98 hot table")
+		}
+	} else {
+		hotBuilder.Finish()
 	}
-	// We own a ref on tbl.
-	err = db.lc.addLevel0Table(tbl) // 将当前创建的表对象加到到levelcontroler的第0层以及更新清单文件（注意在上面那个CreateTable函数内就已经写入磁盘了，这里只是让levelcontroler得知新增的SST）
-	_ = tbl.DecrRef()               // Releases our ref.
+
+	// ==========================================
+	// 5. 💥 原子提交：将这两个表同生共死地记入 Manifest！
+	// ==========================================
+	// 原版是 db.lc.addLevel0Table(tbl)，现在我们需要一个新函数同时处理两个！
+	err = db.lc.addFlushTables(coldTbl, hotTbl)
+
+	// 6. 释放引用
+	if coldTbl != nil {
+		_ = coldTbl.DecrRef()
+	}
+	if hotTbl != nil {
+		_ = hotTbl.DecrRef()
+	}
+
 	return err
 }
+
+// 💥 zzlHACK:4801 将原本只处理 L0 的 Flush，升级为处理冷热双轨的 Flush
+func (s *levelsController) addFlushTables(coldTbl *table.Table, hotTbl *table.Table) error {
+	var changes []*pb.ManifestChange
+
+	// ==========================================
+	// 阶段 1：打包 Manifest 变更 (不上户口的黑户会被删)
+	// ==========================================
+	// 组装冷表的户口申请
+	if coldTbl != nil && !coldTbl.IsInmemory {
+		changes = append(changes, newCreateChange(coldTbl.ID(), 0, coldTbl.KeyID(), coldTbl.CompressionType()))
+	}
+
+	// 组装热表的户口申请
+	if hotTbl != nil && !hotTbl.IsInmemory {
+		// 💥 注意：这里的 Level 填 98，代表它是特权热表
+		changes = append(changes, newCreateChange(hotTbl.ID(), 98, hotTbl.KeyID(), hotTbl.CompressionType()))
+	}
+
+	// ==========================================
+	// 阶段 2：原子提交！(LSM-Tree 的绝对护盾)
+	// ==========================================
+	// 只有这唯一的 addChanges 调用。哪怕在它前面或后面断电，都不会产生幽灵文件
+	if len(changes) > 0 {
+		err := s.kv.manifest.addChanges(changes)
+		if err != nil {
+			return err // 如果写 Manifest 失败，直接返回，后面挂载内存也不执行了
+		}
+	}
+
+	// ==========================================
+	// 阶段 3：更新热树内存视图
+	// ==========================================
+	if hotTbl != nil {
+		// 将热表挂载到 L98。
+		// 假设你的热层是 levelHandler 类型（例如 s.levels[98] 或是自定义的 s.hotTier）
+		// 热层通常不需要像 L0 那样去 Stall 前台，因为热层会极速消化到 L99
+		// NOTE: 如果你的热层变量叫别的名字，请替换这里
+		s.hotTier.addHotTable(hotTbl)
+	}
+
+	// ==========================================
+	// 阶段 4：更新冷树 (L0) 内存视图 + 继承原生 Stall 限流机制 (原版代码)
+	// ==========================================
+	if coldTbl != nil {
+		for !s.levels[0].tryAddLevel0Table(coldTbl) {
+			// 如果 L0 拒绝添加 (说明有并发冲突，或者我们即将主动 Stall)
+			// 在解除 Stall 之前，确保 L0 层是健康的 (没有堆积成山)
+			timeStart := time.Now()
+			for s.levels[0].numTables() >= s.kv.opt.NumLevelZeroTablesStall {
+				// 💥 这就是为什么写放大会卡死前台：L0 表满了，强行 Sleep 前台 Flush 线程！
+				time.Sleep(10 * time.Millisecond)
+			}
+			dur := time.Since(timeStart)
+			if dur > time.Second {
+				s.kv.opt.Infof("L0 was stalled for %s\n", dur.Round(time.Millisecond))
+			}
+			s.l0stallsMs.Add(int64(dur.Round(time.Millisecond)))
+		}
+	}
+
+	return nil
+}
+
+// zzlHACK:END
 
 // flushMemtable must keep running until we send it an empty memtable. If there
 // are errors during handling the memtable flush, we'll retry indefinitely.

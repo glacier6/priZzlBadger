@@ -46,9 +46,9 @@ func main() {
 	// ==========================================
 	fmt.Println("\n>>> [阶段 1] 混沌写入与热点培养中 (制造数十万版本冲突)...")
 
-	const totalOps = 1500000
-	const hotKeyCount = 500     // 只有50个热点Key，被疯狂覆写
-	const coldKeyCount = 200000 // 两万个冷数据，做背景干扰
+	const totalOps = 3000000
+	const hotKeyCount = 1000     // 只有50个热点Key，被疯狂覆写
+	const coldKeyCount = 4000000 // 两万个冷数据，做背景干扰
 
 	for i := 0; i < totalOps; i++ {
 		isHot := rand.Intn(100) < 80 // 80% 的概率写热点数据

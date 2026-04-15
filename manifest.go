@@ -448,7 +448,7 @@ func applyManifestChange(build *Manifest, tc *pb.ManifestChange) error {
 		// zzlHACK:4803 清单文件的更改适配hot层
 		if tc.Level == 98 || tc.Level == 99 {
 			build.Creations++
-			return nil // 直接返回！绝不去执行下面的切片扩容！
+			return nil // 直接返回！绝不去执行下面的切片扩容！而上面的build.Tables已经记录过了
 		}
 		// zzlHACK:END
 		for len(build.Levels) <= int(tc.Level) { // 这行可以新增清单文件内的层级结构，一直增加到当前改变的那一个层级
