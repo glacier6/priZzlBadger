@@ -2352,13 +2352,18 @@ type TableInfo struct {
 	BloomFilterSize  int
 }
 
+// zzlHACK:4800 getTableInfo适配热层，这个函数主要是用于初始化时得到maxversion来初始化nextTS，其余都是用在流式写和信息打印了
 func (s *levelsController) getTableInfo() (result []TableInfo) {
-	for _, l := range s.levels {
+	// 定义一个闭包函数，用来提取特定层级的所有表信息
+	appendLevel := func(l *levelHandler) {
+		if l == nil {
+			return
+		}
 		l.RLock()
 		for _, t := range l.tables {
 			info := TableInfo{
 				ID:               t.ID(),
-				Level:            l.level,
+				Level:            l.level, // 自动获取层号 (0~6, 或 98, 99)
 				Left:             t.Smallest(),
 				Right:            t.Biggest(),
 				KeyCount:         t.KeyCount(),
@@ -2373,6 +2378,22 @@ func (s *levelsController) getTableInfo() (result []TableInfo) {
 		}
 		l.RUnlock()
 	}
+
+	// 1. 遍历并装载主树 (L0 ~ L6)
+	for _, l := range s.levels {
+		appendLevel(l)
+	}
+
+	// ==========================================
+	// 💥 暴露热区表信息！
+	// 让 MaxVersion 能看到最新时间戳，防止幽灵读；
+	// 让 LevelsToString 能打印出 L98/L99 的监控指标！
+	// ==========================================
+	appendLevel(s.hotTier)    // 装载 L98
+	appendLevel(s.hotTierOrd) // 装载 L99
+	// zzlHACK:END
+
+	// 对结果进行全局排序
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Level != result[j].Level {
 			return result[i].Level < result[j].Level
@@ -2382,6 +2403,37 @@ func (s *levelsController) getTableInfo() (result []TableInfo) {
 	return
 }
 
+//	func (s *levelsController) getTableInfo() (result []TableInfo) {
+//		for _, l := range s.levels {
+//			l.RLock()
+//			for _, t := range l.tables {
+//				info := TableInfo{
+//					ID:               t.ID(),
+//					Level:            l.level,
+//					Left:             t.Smallest(),
+//					Right:            t.Biggest(),
+//					KeyCount:         t.KeyCount(),
+//					OnDiskSize:       t.OnDiskSize(),
+//					StaleDataSize:    t.StaleDataSize(),
+//					IndexSz:          t.IndexSize(),
+//					BloomFilterSize:  t.BloomFilterSize(),
+//					UncompressedSize: t.UncompressedSize(),
+//					MaxVersion:       t.MaxVersion(),
+//				}
+//				result = append(result, info)
+//			}
+//			l.RUnlock()
+//		}
+//		sort.Slice(result, func(i, j int) bool {
+//			if result[i].Level != result[j].Level {
+//				return result[i].Level < result[j].Level
+//			}
+//			return result[i].ID < result[j].ID
+//		})
+//		return
+//	}
+//
+// zzlHACK:END
 type LevelInfo struct {
 	Level          int
 	NumTables      int

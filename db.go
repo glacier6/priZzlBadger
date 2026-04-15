@@ -1309,6 +1309,21 @@ func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
 	// 原版是 db.lc.addLevel0Table(tbl)，现在我们需要一个新函数同时处理两个！
 	err = db.lc.addFlushTables(coldTbl, hotTbl)
 
+	// zzlHACK:4804 探测分流后的碎片情况
+	// var coldSize, hotSize int64
+	// if coldTbl != nil {
+	// 	coldSize = coldTbl.Size()
+	// }
+	// if hotTbl != nil {
+	// 	hotSize = hotTbl.Size()
+	// }
+
+	// // 打印日志 (单位可以换算成 MB 方便观察)
+	// fmt.Printf("🔥 Flush 分流报告 -> 冷大巴(L0): %.2f MB, 热大巴(L98): %.2f MB \n",
+	// 	float64(coldSize)/(1024*1024),
+	// 	float64(hotSize)/(1024*1024))
+	// zzlHACK:END
+
 	// 6. 释放引用
 	if coldTbl != nil {
 		_ = coldTbl.DecrRef()

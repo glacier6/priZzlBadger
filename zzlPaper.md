@@ -440,3 +440,4 @@ NOTE:NOTE:也正因为如此，BadgerDB的get需要遍历出某个KEY的所有�
         <!-- 总的来说，YCSB 可以通过以下方式进一步改进：1）添加基于键范围的分布模型作为生成 Key 的选项，2）提供吞吐量控制来模拟 QPS 变化，3）提供 Key 和 Value 大小分布模型，以及 4）增加模拟不同压缩率的能力。 -->
         <!-- https://github.com/facebook/rocksdb/wiki/RocksDB-Trace%2C-Replay%2C-Analyzer%2C-and-Workload-Generationr  -->
 
+      - 13.Fragmentation-induced Write Amplification zzlTODO:这个gemini说是碎片引发的写放大？回来可能需要引用 
