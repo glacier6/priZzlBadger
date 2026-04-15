@@ -858,7 +858,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 	// Check overlap of the top level with the levels which are not being
 	// compacted in this compaction.
-	hasOverlap := s.checkOverlap(cd.allTables(), cd.nextLevel.level+1, cd.thisLevel.level, cd.t.baseLevel) //覆盖度检查，检查两层中受影响的SST（即top + bot）的总范围是否与更底层之间有重叠 zzlHACK:4803追加传入当前层级以及baseLevel zzlTODO:更改适配FLUSH分流
+	hasOverlap := s.checkOverlap(cd.allTables(), cd.nextLevel.level+1, cd.thisLevel.level, cd.t.baseLevel) //覆盖度检查，检查两层中受影响的SST（即top + bot）的总范围是否与更底层之间有重叠 zzlHACK:4803追加传入当前层级以及baseLevel
 	// Pick a discard ts, so we can discard versions below this ts. We should
 	// never discard any versions starting from above this timestamp, because
 	// that would affect the snapshot view guarantee provided by transactions.
