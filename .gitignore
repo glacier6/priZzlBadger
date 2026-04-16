@@ -9,3 +9,4 @@ zzlCode/DISCARD
 zzlCode/KEYREGISTRY
 zzlCode/MANIFEST
 zzlTestHeatLsm/zzl_badger_data_debug
+zzlTestHeatLsmLarge/zzl_badger_data_debug

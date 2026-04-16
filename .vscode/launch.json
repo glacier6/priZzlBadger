@@ -23,6 +23,15 @@
       "showLog": true
     },
     {
+      "name": "zzlTestLSMLarge",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceRoot}/zzlTestHeatLsmLarge/", // 运行文件的地址，默认会找到这里面的main函数
+      "args": [],
+      "showLog": true
+    },
+    {
         "name": "testOnlyHeatLsm", 
         "type": "go",
         "request": "launch",

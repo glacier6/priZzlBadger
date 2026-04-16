@@ -5,6 +5,8 @@
 3.查询流程修改 在 zzlHACK:4802
 4.compaction维护 zzlHACK:4803
 5.compaction跟踪 zzlHACK:4804
+6.有关GC的实现 zzlHACK:4160
+
 TODO:还要加hot层的自我合并(或者内存和并?)以及下放冷数据!!!!
 TODO:测试查询出来数据的正确性
 TODO:增加树衰减时如何减枝的操作!以及已经是高覆盖率的节点停止分裂

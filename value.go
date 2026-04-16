@@ -32,6 +32,18 @@ import (
 // uint32, so limiting at max uint32.
 var maxVlogFileSize uint32 = math.MaxUint32
 
+// zzlHACK:4160 Vlog 冷热分离掩码
+// 利用 FID 的最高位作为标记。
+// 0 开头的是冷文件 (如 1, 2, 3...)
+// 1 开头的是热文件 (如 2147483649, 2147483650...)
+const HotVlogFidMask uint32 = 0x80000000
+
+func isHotVlog(fid uint32) bool {
+	return fid&HotVlogFidMask != 0
+}
+
+// zzlHACK:END
+
 // Values have their first byte being byteData or byteDelete. This helps us distinguish between
 // a key that has never been seen and a key that has been explicitly deleted.
 // 值的第一个字节是byteData或byteDelete。这有助于我们区分从未见过的密钥和已被明确删除的密钥。
@@ -408,6 +420,7 @@ func (vlog *valueLog) deleteLogFile(lf *logFile) error {
 	return lf.Delete()
 }
 
+// 下面这个函数是清空VLOG
 func (vlog *valueLog) dropAll() (int, error) {
 	// If db is opened in InMemory mode, we don't need to do anything since there are no vlog files.
 	if vlog.db.opt.InMemory {
@@ -434,9 +447,17 @@ func (vlog *valueLog) dropAll() (int, error) {
 	}
 
 	vlog.db.opt.Infof("Value logs deleted. Creating value log file: 1")
-	if _, err := vlog.createVlogFile(); err != nil { // Called while writes are stopped.
+	// zzlHACK:4160 适配双Vlog写入
+	if _, err := vlog.createVlogFile(false); err != nil { // 创建冷大巴
 		return count, err
 	}
+	if _, err := vlog.createVlogFile(true); err != nil { // 创建热大巴
+		return count, err
+	}
+	// if _, err := vlog.createVlogFile(); err != nil { // Called while writes are stopped.
+	// 	return count, err
+	// }
+	// zzlHACK:END
 	return count, nil
 }
 
@@ -448,18 +469,24 @@ type valueLog struct {
 	dirPath string
 
 	// guards our view of which files exist, which to be deleted, how many active iterators
-	filesLock        sync.RWMutex
-	filesMap         map[uint32]*logFile
-	maxFid           uint32
+	filesLock sync.RWMutex
+	filesMap  map[uint32]*logFile
+	maxFid    uint32
+	// zzlHACK:4160 增加热Vlog
+	hotMaxFid uint32   // 热数据的最大 FID
+	activeHot *logFile // 当前正在写入的热数据 Vlog 文件
+	// zzlHACK:END
 	filesToBeDeleted []uint32
 	// A refcount of iterators -- when this hits zero, we can delete the filesToBeDeleted.
 	// 迭代器的重新计数——当这个值为零时，我们可以删除ToBeDeleted文件。
 	numActiveIterators atomic.Int32
 
-	db                *DB
-	writableLogOffset atomic.Uint32 // read by read, written by write
-	numEntriesWritten uint32
-	opt               Options
+	db                   *DB
+	writableLogOffset    atomic.Uint32 // read by read, written by write 冷大巴的专属偏移量追踪器
+	numEntriesWritten    uint32
+	hotWritableLogOffset atomic.Uint32 // zzlHACK:4160  增加热大巴专属偏移量追踪器
+	hotNumEntriesWritten uint32        // zzlHACK:4160  增加热大巴专属偏移量追踪器热大巴的专属计客器
+	opt                  Options
 
 	garbageCh    chan struct{}
 	discardStats *discardStats
@@ -502,15 +529,39 @@ func (vlog *valueLog) populateFilesMap() error {
 			registry: vlog.db.registry,
 		}
 		vlog.filesMap[uint32(fid)] = lf
-		if vlog.maxFid < uint32(fid) {
-			vlog.maxFid = uint32(fid)
+		// zzlHACK:4160 启动时分离扫描冷、热大巴的 MaxFid
+		if isHotVlog(uint32(fid)) {
+			if vlog.hotMaxFid < uint32(fid) {
+				vlog.hotMaxFid = uint32(fid)
+			}
+		} else {
+			if vlog.maxFid < uint32(fid) {
+				vlog.maxFid = uint32(fid)
+			}
 		}
+		// if vlog.maxFid < uint32(fid) {
+		// 	vlog.maxFid = uint32(fid)
+		// }
+		// zzlHACK:END
 	}
 	return nil
 }
 
-func (vlog *valueLog) createVlogFile() (*logFile, error) {
-	fid := vlog.maxFid + 1
+// zzlHACK:4160 改造创建Vlog文件逻辑，支持冷热双轨
+func (vlog *valueLog) createVlogFile(isHot bool) (*logFile, error) {
+	var fid uint32
+
+	// 根据冷热分配不同的 FID
+	if isHot {
+		if vlog.hotMaxFid == 0 {
+			fid = HotVlogFidMask | 1 // 第一个热文件
+		} else {
+			fid = vlog.hotMaxFid + 1
+		}
+	} else {
+		fid = vlog.maxFid + 1
+	}
+
 	path := vlog.fpath(fid)
 	lf := &logFile{
 		fid:      fid,
@@ -519,24 +570,71 @@ func (vlog *valueLog) createVlogFile() (*logFile, error) {
 		writeAt:  vlogHeaderSize,
 		opt:      vlog.opt,
 	}
-	err := lf.open(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 2*vlog.opt.ValueLogFileSize) //创建.vlog文件，名字也是类似0001.vlog
+
+	err := lf.open(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 2*vlog.opt.ValueLogFileSize)
 	if err != z.NewFile && err != nil {
 		return nil, err
 	}
 
 	vlog.filesLock.Lock()
 	vlog.filesMap[fid] = lf
-	y.AssertTrue(vlog.maxFid < fid)
-	vlog.maxFid = fid
+
+	// 更新对应的 MaxFid 和活跃指针
+	if isHot {
+		vlog.hotMaxFid = fid
+		vlog.activeHot = lf // 挂载最新的热大巴
+	} else {
+		y.AssertTrue(vlog.maxFid < fid)
+		vlog.maxFid = fid
+	}
+
 	// writableLogOffset is only written by write func, by read by Read func.
 	// To avoid a race condition, all reads and updates to this variable must be
 	// done via atomics.
-	vlog.writableLogOffset.Store(vlogHeaderSize)
-	vlog.numEntriesWritten = 0
+	// 注意：冷热双轨后，这个偏移量主要用于冷文件，或者我们可以暂时共享它，
+	// 给对应的大巴计价器清零
+	if isHot {
+		vlog.hotWritableLogOffset.Store(vlogHeaderSize)
+		vlog.hotNumEntriesWritten = 0 // 热大巴清零
+	} else {
+		vlog.writableLogOffset.Store(vlogHeaderSize)
+		vlog.numEntriesWritten = 0 // 冷大巴清零
+	}
 	vlog.filesLock.Unlock()
 
 	return lf, nil
 }
+
+// func (vlog *valueLog) createVlogFile() (*logFile, error) {
+// 	fid := vlog.maxFid + 1
+// 	path := vlog.fpath(fid)
+// 	lf := &logFile{
+// 		fid:      fid,
+// 		path:     path,
+// 		registry: vlog.db.registry,
+// 		writeAt:  vlogHeaderSize,
+// 		opt:      vlog.opt,
+// 	}
+// 	err := lf.open(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 2*vlog.opt.ValueLogFileSize) //创建.vlog文件，名字也是类似0001.vlog
+// 	if err != z.NewFile && err != nil {
+// 		return nil, err
+// 	}
+
+// 	vlog.filesLock.Lock()
+// 	vlog.filesMap[fid] = lf
+// 	y.AssertTrue(vlog.maxFid < fid)
+// 	vlog.maxFid = fid
+// 	// writableLogOffset is only written by write func, by read by Read func.
+// 	// To avoid a race condition, all reads and updates to this variable must be
+// 	// done via atomics.
+// 	vlog.writableLogOffset.Store(vlogHeaderSize)
+// 	vlog.numEntriesWritten = 0
+// 	vlog.filesLock.Unlock()
+
+// 	return lf, nil
+// }
+
+// zzlHACK:END
 
 func errFile(err error, path string, msg string) error {
 	return fmt.Errorf("%s. Path=%s. Error=%v", msg, path, err)
@@ -577,8 +675,18 @@ func (vlog *valueLog) open(db *DB) error {
 		if vlog.opt.ReadOnly {
 			return nil
 		}
-		_, err := vlog.createVlogFile() //没有Vlog文件，需要创建一个logFile
-		return y.Wrapf(err, "Error while creating log file in valueLog.open")
+		// zzlHACK:4160 初始化时，必须同时发车一冷一热两辆新大巴
+		if _, err := vlog.createVlogFile(false); err != nil {
+			return y.Wrapf(err, "Error creating cold log file")
+		}
+		if _, err := vlog.createVlogFile(true); err != nil {
+			return y.Wrapf(err, "Error creating hot log file")
+		}
+		return nil
+		// _, err := vlog.createVlogFile() //没有Vlog文件，需要创建一个logFile
+		// return y.Wrapf(err, "Error while creating log file in valueLog.open")
+		// zzlHACK:END
+
 	}
 	fids := vlog.sortedFids()  // 按fid排序好vlog文件
 	for _, fid := range fids { //  处理排序好的vlog文件
@@ -592,7 +700,7 @@ func (vlog *valueLog) open(db *DB) error {
 			return y.Wrapf(err, "Open existing file: %q", lf.path)
 		}
 		// We shouldn't delete the maxFid file.
-		if lf.size.Load() == vlogHeaderSize && fid != vlog.maxFid { //删除空的（即只有头大小的vlog文件）
+		if lf.size.Load() == vlogHeaderSize && fid != vlog.maxFid && fid != vlog.hotMaxFid { //删除空的（即只有头大小的vlog文件） zzlHACK:4160 我们不能删除冷轨的最大文件，也不能删除热轨的最大文件
 			vlog.opt.Infof("Deleting empty file: %s", lf.path)
 			if err := lf.Delete(); err != nil {
 				return y.Wrapf(err, "while trying to delete empty file: %s", lf.path)
@@ -604,29 +712,69 @@ func (vlog *valueLog) open(db *DB) error {
 	if vlog.opt.ReadOnly {
 		return nil
 	}
+	// zzlHACK:4160 封装一个截断函数，用于处理上次崩溃可能留下的坏数据
+	truncateIfNeeded := func(targetFid uint32) error {
+		if targetFid == 0 {
+			return nil // 可能还没有热数据文件
+		}
+		last, ok := vlog.filesMap[targetFid]
+		if !ok {
+			return nil
+		}
+		lastOff, err := last.iterate(vlog.opt.ReadOnly, vlogHeaderSize,
+			func(_ Entry, vp valuePointer) error {
+				return nil
+			})
+		if err != nil {
+			return y.Wrapf(err, "while iterating over: %s", last.path)
+		}
+		if err := last.Truncate(int64(lastOff)); err != nil {
+			return y.Wrapf(err, "while truncating last value log file: %s", last.path)
+		}
+		return nil
+	}
+
+	// 分别截断冷大巴和热大巴
+	if err := truncateIfNeeded(vlog.maxFid); err != nil {
+		return err
+	}
+	if err := truncateIfNeeded(vlog.hotMaxFid); err != nil {
+		return err
+	}
+
+	// ==== 数据库重新打开后，老规矩，不写旧文件，重新创建冷热双轨新大巴 ====
+	if _, err := vlog.createVlogFile(false); err != nil {
+		return y.Wrapf(err, "Error creating cold log file")
+	}
+	if _, err := vlog.createVlogFile(true); err != nil {
+		return y.Wrapf(err, "Error creating hot log file")
+	}
+
+	return nil
 	// Now we can read the latest value log file, and see if it needs truncation. We could
 	// technically do this over all the value log files, but that would mean slowing down the value
 	// log open.
 	// 现在我们可以读取最新的值日志文件，并查看它是否需要截断。从技术上讲，我们可以对所有值日志文件执行此操作，但这意味着打开值日志的速度会减慢。
-	last, ok := vlog.filesMap[vlog.maxFid]
-	y.AssertTrue(ok)
-	lastOff, err := last.iterate(vlog.opt.ReadOnly, vlogHeaderSize, //获取实际大小
-		func(_ Entry, vp valuePointer) error {
-			return nil
-		})
-	if err != nil {
-		return y.Wrapf(err, "while iterating over: %s", last.path)
-	}
-	if err := last.Truncate(int64(lastOff)); err != nil { //按照实际大小截断这个最新的vlog文件
-		return y.Wrapf(err, "while truncating last value log file: %s", last.path)
-	}
+	// last, ok := vlog.filesMap[vlog.maxFid]
+	// y.AssertTrue(ok)
+	// lastOff, err := last.iterate(vlog.opt.ReadOnly, vlogHeaderSize, //获取实际大小
+	// 	func(_ Entry, vp valuePointer) error {
+	// 		return nil
+	// 	})
+	// if err != nil {
+	// 	return y.Wrapf(err, "while iterating over: %s", last.path)
+	// }
+	// if err := last.Truncate(int64(lastOff)); err != nil { //按照实际大小截断这个最新的vlog文件
+	// 	return y.Wrapf(err, "while truncating last value log file: %s", last.path)
+	// }
 
-	// Don't write to the old log file. Always create a new one.
-	// 不要写入旧日志文件。总是创建一个新的。
-	if _, err := vlog.createVlogFile(); err != nil { // 创建一个新的活跃的vlog文件
-		return y.Wrapf(err, "Error while creating log file in valueLog.open")
-	}
-	return nil
+	// // Don't write to the old log file. Always create a new one.
+	// // 不要写入旧日志文件。总是创建一个新的。
+	// if _, err := vlog.createVlogFile(); err != nil { // 创建一个新的活跃的vlog文件
+	// 	return y.Wrapf(err, "Error while creating log file in valueLog.open")
+	// }
+	// return nil
+	// zzlHACK:END
 }
 
 func (vlog *valueLog) Close() error {
@@ -759,35 +907,78 @@ func (vlog *valueLog) woffset() uint32 {
 	return vlog.writableLogOffset.Load()
 }
 
-// validateWrites will check whether the given requests can fit into 4GB vlog file.
-// NOTE: 4GB is the maximum size we can create for vlog because value pointer offset is of type
-// uint32. If we create more than 4GB, it will overflow uint32. So, limiting the size to 4GB.
-/*
-validateWrites将检查给定的请求是否可以放入4GB的vlog文件中。注意：4GB是我们可以为vlog创建的最大大小，因为值指针偏移量的类型是uint32。如果我们创建超过4GB，它将溢出uint32。因此，将大小限制为4GB。
-*/
+// zzlHACK:4160 大小检查从检查单个适配为同时检查冷热！悲观预测当批次会全放在冷或热
 func (vlog *valueLog) validateWrites(reqs []*request) error {
-	vlogOffset := uint64(vlog.woffset()) // 这里是得到当前活跃的vlog文件的当前偏移量
+	coldOffset := uint64(vlog.woffset())
+	hotOffset := uint64(vlog.hotWritableLogOffset.Load())
+
 	for _, req := range reqs {
-		// calculate size of the request.
-		size := estimateRequestSize(req)                   //得到单个的req大小
-		estimatedVlogOffset := vlogOffset + size           //累加
-		if estimatedVlogOffset > uint64(maxVlogFileSize) { //如果累加值大于2的32次方-1
-			return errors.Errorf("Request size offset %d is bigger than maximum offset %d", //数据太大，溢出了，已经一个vlog放不下了
-				estimatedVlogOffset, maxVlogFileSize)
+		// 直接用原版的辅助函数，算出这批 req 的总大小
+		size := estimateRequestSize(req)
+
+		// ==========================================
+		// 1. 悲观预测：假设这批数据 100% 全塞进冷大巴
+		// ==========================================
+		estColdOffset := coldOffset + size
+		if estColdOffset > uint64(maxVlogFileSize) {
+			return errors.Errorf("Cold request size offset %d is bigger than maximum offset %d", estColdOffset, maxVlogFileSize)
+		}
+		if estColdOffset >= uint64(vlog.opt.ValueLogFileSize) {
+			// 如果超过配置大小，说明待会儿 write 时一定会触发创建新文件
+			// 所以把偏移量重置为 0，继续模拟下一个 req
+			coldOffset = 0
+		} else {
+			coldOffset = estColdOffset
 		}
 
-		if estimatedVlogOffset >= uint64(vlog.opt.ValueLogFileSize) { //如果累加值大于2的30次方-1，注意这里还未到4G，也就是说是提前进行了分割，避免上面的报错
-			// We'll create a new vlog file if the estimated offset is greater or equal to
-			// max vlog size. So, resetting the vlogOffset.
-			// 如果估计的偏移量大于或等于最大vlog大小，我们将创建一个新的vlog文件（即切割）。因此，重置vlogOffset。
-			vlogOffset = 0
-			continue
+		// ==========================================
+		// 2. 悲观预测：假设这批数据 100% 全塞进热大巴
+		// ==========================================
+		estHotOffset := hotOffset + size
+		if estHotOffset > uint64(maxVlogFileSize) {
+			return errors.Errorf("Hot request size offset %d is bigger than maximum offset %d", estHotOffset, maxVlogFileSize)
 		}
-		// Estimated vlog offset will become current vlog offset if the vlog is not rotated.
-		vlogOffset = estimatedVlogOffset
+		if estHotOffset >= uint64(vlog.opt.ValueLogFileSize) {
+			// 同样，如果热车超载，模拟发新车
+			hotOffset = 0
+		} else {
+			hotOffset = estHotOffset
+		}
 	}
 	return nil
 }
+
+// // validateWrites will check whether the given requests can fit into 4GB vlog file.
+// // NOTE: 4GB is the maximum size we can create for vlog because value pointer offset is of type
+// // uint32. If we create more than 4GB, it will overflow uint32. So, limiting the size to 4GB.
+// /*
+// validateWrites将检查给定的请求是否可以放入4GB的vlog文件中。注意：4GB是我们可以为vlog创建的最大大小，因为值指针偏移量的类型是uint32。如果我们创建超过4GB，它将溢出uint32。因此，将大小限制为4GB。
+// */
+// func (vlog *valueLog) validateWrites(reqs []*request) error {
+// 	vlogOffset := uint64(vlog.woffset()) // 这里是得到当前活跃的vlog文件的当前偏移量
+// 	for _, req := range reqs {
+// 		// calculate size of the request.
+// 		size := estimateRequestSize(req)                   //得到单个的req大小
+// 		estimatedVlogOffset := vlogOffset + size           //累加
+// 		if estimatedVlogOffset > uint64(maxVlogFileSize) { //如果累加值大于2的32次方-1
+// 			return errors.Errorf("Request size offset %d is bigger than maximum offset %d", //数据太大，溢出了，已经一个vlog放不下了
+// 				estimatedVlogOffset, maxVlogFileSize)
+// 		}
+
+// 		if estimatedVlogOffset >= uint64(vlog.opt.ValueLogFileSize) { //如果累加值大于2的30次方-1，注意这里还未到4G，也就是说是提前进行了分割，避免上面的报错
+// 			// We'll create a new vlog file if the estimated offset is greater or equal to
+// 			// max vlog size. So, resetting the vlogOffset.
+// 			// 如果估计的偏移量大于或等于最大vlog大小，我们将创建一个新的vlog文件（即切割）。因此，重置vlogOffset。
+// 			vlogOffset = 0
+// 			continue
+// 		}
+// 		// Estimated vlog offset will become current vlog offset if the vlog is not rotated.
+// 		vlogOffset = estimatedVlogOffset
+// 	}
+// 	return nil
+// }
+
+// zzlHACK:END
 
 // estimateRequestSize returns the size that needed to be written for the given request.
 func estimateRequestSize(req *request) uint64 {
@@ -798,136 +989,307 @@ func estimateRequestSize(req *request) uint64 {
 	return size
 }
 
-// write is thread-unsafe by design and should not be called concurrently.
-func (vlog *valueLog) write(reqs []*request) error { //这里面将大KV对的V写入磁盘的vlog中（记住是通过mmap方式写入的）
+// zzlHACK:4160重写vlog的write函数
+func (vlog *valueLog) write(reqs []*request) error {
 	if vlog.db.opt.InMemory {
 		return nil
 	}
 	// Validate writes before writing to vlog. Because, we don't want to partially write and return
 	// an error.
+	// 这个主要是为了防止越界，单批次写完导致Vlog超过4GB
 	if err := vlog.validateWrites(reqs); err != nil { // 进行写请求的检查
 		return y.Wrapf(err, "while validating writes")
 	}
 
 	vlog.filesLock.RLock()
-	maxFid := vlog.maxFid          // 就是Vlog文件的那个前缀数字（取最大的），最大的也是活跃的vlog
-	curlf := vlog.filesMap[maxFid] // 表示当前活跃的vlog对象
+	activeCold := vlog.filesMap[vlog.maxFid]
+	activeHot := vlog.activeHot
 	vlog.filesLock.RUnlock()
 
 	defer func() {
 		if vlog.opt.SyncWrites {
-			if err := curlf.Sync(); err != nil {
-				vlog.opt.Errorf("Error while curlf sync: %v\n", err)
+			if activeCold != nil {
+				_ = activeCold.Sync()
+			}
+			if activeHot != nil {
+				_ = activeHot.Sync()
 			}
 		}
 	}()
 
-	// 一次处理一个kv对（即一个entry）
-	write := func(buf *bytes.Buffer) error {
+	// 闭包 1：写冷数据 （原版代码一模一样）
+	writeCold := func(buf *bytes.Buffer) error {
 		if buf.Len() == 0 {
 			return nil
 		}
-
 		n := uint32(buf.Len())
-		endOffset := vlog.writableLogOffset.Add(n) // 偏移位置累加
-		// Increase the file size if we cannot accommodate this entry.
-		// [Aman] Should this be >= or just >? Doesn't make sense to extend the file if it big enough already.
-		//如果我们无法容纳此条目，请增加文件大小。
-		//[Aman]这应该是>=还是只是>？如果文件已经足够大，扩展它是没有意义的。
-		if int(endOffset) >= len(curlf.Data) { // zzlTODO:回来需要再去看看下面这里是干啥的，需要去看Ristretto的使用文档，看函数啥意思（大致是对mmap进行的截断操作）
-			if err := curlf.Truncate(int64(endOffset)); err != nil {
+		endOffset := vlog.writableLogOffset.Add(n)
+		if int(endOffset) >= len(activeCold.Data) {
+			if err := activeCold.Truncate(int64(endOffset)); err != nil {
 				return err
 			}
 		}
-
 		start := int(endOffset - n)
-		y.AssertTrue(copy(curlf.Data[start:], buf.Bytes()) == int(n)) //NOTE:核心操作，放入curlf对象内，后续因为是mmap方式再由操作系统放入磁盘即可
-
-		curlf.size.Store(endOffset) //更新偏移位置
+		y.AssertTrue(copy(activeCold.Data[start:], buf.Bytes()) == int(n))
+		activeCold.size.Store(endOffset)
 		return nil
 	}
 
-	//具体落盘操作
-	toDisk := func() error {
-		if vlog.woffset() > uint32(vlog.opt.ValueLogFileSize) || //如果当前活跃的vlog的偏移量大于最大文件大小限制 或者 当前vlog的写入kv对数量大于最大写入个数限制
-			vlog.numEntriesWritten > vlog.opt.ValueLogMaxEntries {
-			if err := curlf.doneWriting(vlog.woffset()); err != nil { //标志当前vlog文件写满，在该函数内，如果设置了同步则会直接系统调用sync，最后根据offset截断mmap
+	// 闭包 2：写热数据（与原版代码就是操作的Vlog变了）
+	writeHot := func(buf *bytes.Buffer) error {
+		if buf.Len() == 0 {
+			return nil
+		}
+		n := uint32(buf.Len())
+		endOffset := vlog.hotWritableLogOffset.Add(n)
+		if int(endOffset) >= len(activeHot.Data) {
+			if err := activeHot.Truncate(int64(endOffset)); err != nil {
 				return err
 			}
+		}
+		start := int(endOffset - n)
+		y.AssertTrue(copy(activeHot.Data[start:], buf.Bytes()) == int(n))
+		activeHot.size.Store(endOffset)
+		return nil
+	}
 
-			newlf, err := vlog.createVlogFile() //创建新的vlog文件
+	// 闭包 3：磁盘滚文件 (满载发车)
+	toDisk := func() error {
+		// 检查冷大巴是否满载
+		if vlog.woffset() > uint32(vlog.opt.ValueLogFileSize) ||
+			vlog.numEntriesWritten > vlog.opt.ValueLogMaxEntries {
+			if err := activeCold.doneWriting(vlog.woffset()); err != nil {
+				return err
+			}
+			newlf, err := vlog.createVlogFile(false) // 发新的冷车
 			if err != nil {
 				return err
 			}
-			curlf = newlf
+			activeCold = newlf
+		}
+		// 检查热大巴是否满载
+		if vlog.hotWritableLogOffset.Load() > uint32(vlog.opt.ValueLogFileSize) ||
+			vlog.hotNumEntriesWritten > vlog.opt.ValueLogMaxEntries {
+			if err := activeHot.doneWriting(vlog.hotWritableLogOffset.Load()); err != nil {
+				return err
+			}
+			newlf, err := vlog.createVlogFile(true) // 发新的热车
+			if err != nil {
+				return err
+			}
+			activeHot = newlf
 		}
 		return nil
 	}
 
-	buf := new(bytes.Buffer)
-	//开始真正遍历reqs，每个req里面有一个Entries数组
+	var coldBuf, hotBuf bytes.Buffer
+
 	for i := range reqs {
 		b := reqs[i]
-		b.Ptrs = b.Ptrs[:0] // 这个数组用来记录处理后的kv对，包含kv分离的以及不分离的，不分离的valuePointer对象为空，注意b.ptrs的顺序与b.Entries的顺序一一对应
-		var written, bytesWritten int
+		b.Ptrs = b.Ptrs[:0]
+
+		var coldWritten, hotWritten int
+		var bytesWritten int
 		valueSizes := make([]int64, 0, len(b.Entries))
-		// 遍历当前请求的kv对数组，挨个执行写入且进行统计
+
 		for j := range b.Entries {
-			buf.Reset()
+			coldBuf.Reset()
+			hotBuf.Reset()
 
 			e := b.Entries[j]
-			valueSizes = append(valueSizes, int64(len(e.Value)))     //得到当前单个kv对的v大小
-			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) { // 是否跳过vlog，为true就是kv全放LSM树
-				// valueThreshold就是分大小kv的那个阈值，注意，每个kv对象Entry内都会存一个，所以就算之后改变这个阈值，老系统也能正常运转
-				b.Ptrs = append(b.Ptrs, valuePointer{}) // 现在加在这里面的就是不用kv分离的，因为没有在Vlog中的数据，所以valuePointer为空
+			valueSizes = append(valueSizes, int64(len(e.Value)))
+			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) {
+				b.Ptrs = append(b.Ptrs, valuePointer{})
 				continue
 			}
-			var p valuePointer // 记录当前KV对在哪个Vlog文件及其Vlog文件的偏移量以及Value长度
 
-			p.Fid = curlf.fid
-			p.Offset = vlog.woffset() // 得到当前活跃vlog文件的偏移量
+			var p valuePointer
+			pureKey := y.ParseKey(e.Key)
+			isHot := vlog.db.zzlHeatmap.IsHotKey(pureKey) // 💥 调用你的热力判定
 
-			// We should not store transaction marks in the vlog file because it will never have all
-			// the entries in a transaction. If we store entries with transaction marks then value
-			// GC will not be able to iterate on the entire vlog file.
-			// But, we still want the entry to stay intact for the memTable WAL. So, store the meta
-			// in a temporary variable and reassign it after writing to the value log.
-			// 我们不应该在vlog文件中存储事务标记，因为它永远不会包含事务中的所有条目。如果我们用事务标记存储条目，那么value GC将无法迭代整个vlog文件。
-			// 但是，我们仍然希望memTable WAL的条目保持不变。因此，将meta存储在临时变量中，并在写入值日志后重新分配。
-			tmpMeta := e.meta //这几行是处理元数据信息的
+			tmpMeta := e.meta
 			e.meta = e.meta &^ (bitTxn | bitFinTxn)
-			plen, err := curlf.encodeEntry(buf, e, p.Offset) // Now encode the entry into buffer.将每个条目写入缓冲区，并返回长度该条目的长度（e是单个kv对）
-			if err != nil {
-				return err
+
+			if isHot {
+				p.Fid = activeHot.fid
+				p.Offset = vlog.hotWritableLogOffset.Load()
+				plen, err := activeHot.encodeEntry(&hotBuf, e, p.Offset)
+				if err != nil {
+					return err
+				}
+				p.Len = uint32(plen)
+				b.Ptrs = append(b.Ptrs, p)
+				if err := writeHot(&hotBuf); err != nil {
+					return err
+				}
+				hotWritten++
+				bytesWritten += plen // 记录热车耗费的字节
+			} else {
+				p.Fid = activeCold.fid
+				p.Offset = vlog.woffset()
+				plen, err := activeCold.encodeEntry(&coldBuf, e, p.Offset)
+				if err != nil {
+					return err
+				}
+				p.Len = uint32(plen)
+				b.Ptrs = append(b.Ptrs, p)
+				if err := writeCold(&coldBuf); err != nil {
+					return err
+				}
+				coldWritten++
+				bytesWritten += plen // 记录冷车耗费的字节
 			}
-			// Restore the meta.
 			e.meta = tmpMeta
-
-			p.Len = uint32(plen)               //记录当前kv对的长度
-			b.Ptrs = append(b.Ptrs, p)         //将当前放入vlog的kv对的信息记录起来
-			if err := write(buf); err != nil { // NOTE:核心操作，真正开始将当前kv对转换的字节流执行写入
-				return err
-			}
-			written++                 //已写入的个数累计
-			bytesWritten += buf.Len() //已写入Vlog的字节流长度
-			// No need to flush anything, we write to file directly via mmap.
-			// 无需刷新任何内容，我们直接通过mmap写入文件。
 		}
-		y.NumWritesVlogAdd(vlog.opt.MetricsEnabled, int64(written)) //这行还有下一行就是一个计数写入vlog的统计量
-		y.NumBytesWrittenVlogAdd(vlog.opt.MetricsEnabled, int64(bytesWritten))
+		vlog.numEntriesWritten += uint32(coldWritten)
+		vlog.hotNumEntriesWritten += uint32(hotWritten)
 
-		vlog.numEntriesWritten += uint32(written)
-		vlog.db.threshold.update(valueSizes)
-		// We write to disk here so that all entries that are part of the same transaction are
-		// written to the same vlog file.
-		// 我们在此将数据写入磁盘，以便同一事务中的所有条目都能
-		// 写入同一份vlog文件。
-		if err := toDisk(); err != nil { // 尝试落盘，即先判断Vlog文件是否满额，满额就去落盘
+		totalWritten := coldWritten + hotWritten
+		y.NumWritesVlogAdd(vlog.opt.MetricsEnabled, int64(totalWritten))
+		y.NumBytesWrittenVlogAdd(vlog.opt.MetricsEnabled, int64(bytesWritten))
+		vlog.db.threshold.update(valueSizes) // NOTE:这个是为了动态 Value 阈值调整！！和VLogPercentile参数有关，但是注意现在这个参数默认为0,即动态阈值默认是关闭状态
+
+		// 检查是否需要换车
+		if err := toDisk(); err != nil {
 			return err
 		}
 	}
 	return toDisk()
 }
+
+// // write is thread-unsafe by design and should not be called concurrently.
+// func (vlog *valueLog) write(reqs []*request) error { //这里面将大KV对的V写入磁盘的vlog中（记住是通过mmap方式写入的）
+// 	if vlog.db.opt.InMemory {
+// 		return nil
+// 	}
+// 	// Validate writes before writing to vlog. Because, we don't want to partially write and return
+// 	// an error.
+// 	// 这个主要是为了防止越界，单批次写完导致Vlog超过4GB
+// 	if err := vlog.validateWrites(reqs); err != nil { // 进行写请求的检查
+// 		return y.Wrapf(err, "while validating writes")
+// 	}
+
+// 	vlog.filesLock.RLock()
+// 	maxFid := vlog.maxFid          // 就是Vlog文件的那个前缀数字（取最大的），最大的也是活跃的vlog
+// 	curlf := vlog.filesMap[maxFid] // 表示当前活跃的vlog对象
+// 	vlog.filesLock.RUnlock()
+
+// 	defer func() {
+// 		if vlog.opt.SyncWrites {
+// 			if err := curlf.Sync(); err != nil {
+// 				vlog.opt.Errorf("Error while curlf sync: %v\n", err)
+// 			}
+// 		}
+// 	}()
+
+// 	// 一次处理一个kv对（即一个entry）
+// 	write := func(buf *bytes.Buffer) error {
+// 		if buf.Len() == 0 {
+// 			return nil
+// 		}
+
+// 		n := uint32(buf.Len())
+// 		endOffset := vlog.writableLogOffset.Add(n) // 偏移位置累加
+// 		// Increase the file size if we cannot accommodate this entry.
+// 		// [Aman] Should this be >= or just >? Doesn't make sense to extend the file if it big enough already.
+// 		//如果我们无法容纳此条目，请增加文件大小。
+// 		//[Aman]这应该是>=还是只是>？如果文件已经足够大，扩展它是没有意义的。
+// 		if int(endOffset) >= len(curlf.Data) { // zzlTODO:回来需要再去看看下面这里是干啥的，需要去看Ristretto的使用文档，看函数啥意思（大致是对mmap进行的截断操作）
+// 			if err := curlf.Truncate(int64(endOffset)); err != nil {
+// 				return err
+// 			}
+// 		}
+
+// 		start := int(endOffset - n)
+// 		y.AssertTrue(copy(curlf.Data[start:], buf.Bytes()) == int(n)) //NOTE:核心操作，放入curlf对象内，后续因为是mmap方式再由操作系统放入磁盘即可
+
+// 		curlf.size.Store(endOffset) //更新偏移位置
+// 		return nil
+// 	}
+
+// 	//具体落盘操作
+// 	toDisk := func() error {
+// 		if vlog.woffset() > uint32(vlog.opt.ValueLogFileSize) || //如果当前活跃的vlog的偏移量大于最大文件大小限制 或者 当前vlog的写入kv对数量大于最大写入个数限制
+// 			vlog.numEntriesWritten > vlog.opt.ValueLogMaxEntries {
+// 			if err := curlf.doneWriting(vlog.woffset()); err != nil { //标志当前vlog文件写满，在该函数内，如果设置了同步则会直接系统调用sync，最后根据offset截断mmap
+// 				return err
+// 			}
+
+// 			newlf, err := vlog.createVlogFile() //创建新的vlog文件
+// 			if err != nil {
+// 				return err
+// 			}
+// 			curlf = newlf
+// 		}
+// 		return nil
+// 	}
+
+// 	buf := new(bytes.Buffer)
+// 	//开始真正遍历reqs，每个req里面有一个Entries数组
+// 	for i := range reqs {
+// 		b := reqs[i]
+// 		b.Ptrs = b.Ptrs[:0] // 这个数组用来记录处理后的kv对，包含kv分离的以及不分离的，不分离的valuePointer对象为空，注意b.ptrs的顺序与b.Entries的顺序一一对应
+// 		var written, bytesWritten int
+// 		valueSizes := make([]int64, 0, len(b.Entries))
+// 		// 遍历当前请求的kv对数组，挨个执行写入且进行统计
+// 		for j := range b.Entries {
+// 			buf.Reset()
+
+// 			e := b.Entries[j]
+// 			valueSizes = append(valueSizes, int64(len(e.Value)))     //得到当前单个kv对的v大小
+// 			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) { // 是否跳过vlog，为true就是kv全放LSM树
+// 				// valueThreshold就是分大小kv的那个阈值，注意，每个kv对象Entry内都会存一个，所以就算之后改变这个阈值，老系统也能正常运转
+// 				b.Ptrs = append(b.Ptrs, valuePointer{}) // 现在加在这里面的就是不用kv分离的，因为没有在Vlog中的数据，所以valuePointer为空
+// 				continue
+// 			}
+// 			var p valuePointer // 记录当前KV对在哪个Vlog文件及其Vlog文件的偏移量以及Value长度
+
+// 			p.Fid = curlf.fid
+// 			p.Offset = vlog.woffset() // 得到当前活跃vlog文件的偏移量
+
+// 			// We should not store transaction marks in the vlog file because it will never have all
+// 			// the entries in a transaction. If we store entries with transaction marks then value
+// 			// GC will not be able to iterate on the entire vlog file.
+// 			// But, we still want the entry to stay intact for the memTable WAL. So, store the meta
+// 			// in a temporary variable and reassign it after writing to the value log.
+// 			// 我们不应该在vlog文件中存储事务标记，因为它永远不会包含事务中的所有条目。如果我们用事务标记存储条目，那么value GC将无法迭代整个vlog文件。
+// 			// 但是，我们仍然希望memTable WAL的条目保持不变。因此，将meta存储在临时变量中，并在写入值日志后重新分配。
+// 			tmpMeta := e.meta //这几行是处理元数据信息的
+// 			e.meta = e.meta &^ (bitTxn | bitFinTxn)
+// 			plen, err := curlf.encodeEntry(buf, e, p.Offset) // Now encode the entry into buffer.将每个条目写入缓冲区，并返回长度该条目的长度（e是单个kv对）
+// 			if err != nil {
+// 				return err
+// 			}
+// 			// Restore the meta.
+// 			e.meta = tmpMeta
+
+// 			p.Len = uint32(plen)               //记录当前kv对的长度
+// 			b.Ptrs = append(b.Ptrs, p)         //将当前放入vlog的kv对的信息记录起来
+// 			if err := write(buf); err != nil { // NOTE:核心操作，真正开始将当前kv对转换的字节流执行写入
+// 				return err
+// 			}
+// 			written++                 //已写入的个数累计
+// 			bytesWritten += buf.Len() //已写入Vlog的字节流长度
+// 			// No need to flush anything, we write to file directly via mmap.
+// 			// 无需刷新任何内容，我们直接通过mmap写入文件。
+// 		}
+// 		y.NumWritesVlogAdd(vlog.opt.MetricsEnabled, int64(written)) //这行还有下一行就是一个计数写入vlog的统计量
+// 		y.NumBytesWrittenVlogAdd(vlog.opt.MetricsEnabled, int64(bytesWritten))
+
+// 		vlog.numEntriesWritten += uint32(written)
+// 		vlog.db.threshold.update(valueSizes)
+// 		// We write to disk here so that all entries that are part of the same transaction are
+// 		// written to the same vlog file.
+// 		// 我们在此将数据写入磁盘，以便同一事务中的所有条目都能
+// 		// 写入同一份vlog文件。
+// 		if err := toDisk(); err != nil { // 尝试落盘，即先判断Vlog文件是否满额，满额就去落盘
+// 			return err
+// 		}
+// 	}
+// 	return toDisk()
+// }
+
+// zzlHACK:END
 
 // Gets the logFile and acquires and RLock() for the mmap. You must call RUnlock on the file
 // (if non-nil)
@@ -940,18 +1302,35 @@ func (vlog *valueLog) getFileRLocked(vp valuePointer) (*logFile, error) {
 		return nil, errors.Errorf("file with ID: %d not found", vp.Fid)
 	}
 
-	// Check for valid offset if we are reading from writable log.
-	maxFid := vlog.maxFid
-	// In read-only mode we don't need to check for writable offset as we are not writing anything.
-	// Moreover, this offset is not set in readonly mode.
-	if !vlog.opt.ReadOnly && vp.Fid == maxFid {
-		currentOffset := vlog.woffset()
-		if vp.Offset >= currentOffset {
-			return nil, errors.Errorf(
-				"Invalid value pointer offset: %d greater than current offset: %d",
-				vp.Offset, currentOffset)
+	// zzlHACK:4160 读指针越界校验 (区分冷热大巴)
+	if !vlog.opt.ReadOnly {
+		if vp.Fid == vlog.maxFid {
+			// 如果是指向当前的冷大巴
+			currentOffset := vlog.woffset()
+			if vp.Offset >= currentOffset {
+				return nil, errors.Errorf("Invalid cold value pointer offset: %d >= %d", vp.Offset, currentOffset)
+			}
+		} else if vp.Fid == vlog.hotMaxFid {
+			// 如果是指向当前的热大巴
+			currentOffset := vlog.hotWritableLogOffset.Load()
+			if vp.Offset >= currentOffset {
+				return nil, errors.Errorf("Invalid hot value pointer offset: %d >= %d", vp.Offset, currentOffset)
+			}
 		}
 	}
+	// // Check for valid offset if we are reading from writable log.
+	// maxFid := vlog.maxFid
+	// // In read-only mode we don't need to check for writable offset as we are not writing anything.
+	// // Moreover, this offset is not set in readonly mode.
+	// if !vlog.opt.ReadOnly && vp.Fid == maxFid {
+	// 	currentOffset := vlog.woffset()
+	// 	if vp.Offset >= currentOffset {
+	// 		return nil, errors.Errorf(
+	// 			"Invalid value pointer offset: %d greater than current offset: %d",
+	// 			vp.Offset, currentOffset)
+	// 	}
+	// }
+	// zzlHACK:END
 
 	ret.lock.RLock()
 	return ret, nil
@@ -1222,3 +1601,80 @@ func (v *vlogThreshold) listenForValueThresholdUpdate() {
 		}
 	}
 }
+
+// zzlHACK:4160 打印所有 Vlog 文件的物理大盘与垃圾占比
+func (vlog *valueLog) StatsToString() string {
+	if vlog.opt.InMemory {
+		return "InMemory mode: No Vlog files.\n"
+	}
+
+	vlog.filesLock.RLock()
+	defer vlog.filesLock.RUnlock()
+
+	// 1. 收集垃圾数据统计 (通过 Badger 自带的 Iterate 方法)
+	discardMap := make(map[uint32]int64)
+	if vlog.discardStats != nil {
+		vlog.discardStats.Iterate(func(fid uint64, stats uint64) {
+			discardMap[uint32(fid)] = int64(stats)
+		})
+	}
+	var b strings.Builder
+	b.WriteString("\n=========================================================\n")
+	b.WriteString("📊 关机前 Vlog 物理大盘 (冷热双轨与垃圾存活率)\n")
+	b.WriteString("=========================================================\n")
+
+	fids := make([]uint32, 0, len(vlog.filesMap))
+	for fid := range vlog.filesMap {
+		fids = append(fids, fid)
+	}
+	// 2. 按 FID 排序，方便观察发车的时间线
+	sort.Slice(fids, func(i, j int) bool { return fids[i] < fids[j] })
+
+	var totalSize, totalDiscard int64
+	var hotCount, coldCount int
+
+	for _, fid := range fids {
+		lf := vlog.filesMap[fid]
+		size := lf.size.Load()
+		discard := discardMap[fid]
+
+		ratio := float64(0)
+		if size > 0 {
+			ratio = float64(discard) / float64(size) * 100.0
+		}
+
+		totalSize += int64(size)
+		totalDiscard += discard
+
+		vlogType := "[Cold 🧊]"
+		if isHotVlog(fid) {
+			vlogType = "[Hot  🔥]"
+			hotCount++
+		} else {
+			coldCount++
+		}
+
+		activeMarker := "   "
+		if fid == vlog.maxFid || fid == vlog.hotMaxFid {
+			activeMarker = "(*)" // 标记当前正在接受写入的大巴
+		}
+
+		b.WriteString(fmt.Sprintf("%s %s FID: %-10d | Size: %7.2f MB | Discard(垃圾): %7.2f MB | Garbage Ratio: %5.2f%%\n",
+			activeMarker, vlogType, fid,
+			float64(size)/(1048576), float64(discard)/(1048576), ratio))
+	}
+	b.WriteString("---------------------------------------------------------\n")
+	b.WriteString(fmt.Sprintf("📈 汇总: 共 %d 个冷大巴, %d 个热大巴\n", coldCount, hotCount))
+
+	overallRatio := float64(0)
+	if totalSize > 0 {
+		overallRatio = float64(totalDiscard) / float64(totalSize) * 100.0
+	}
+	b.WriteString(fmt.Sprintf("总容量: %.2f MB | 总垃圾: %.2f MB | 整体垃圾率: %.2f%%\n",
+		float64(totalSize)/(1048576), float64(totalDiscard)/(1048576), overallRatio))
+	b.WriteString("=========================================================\n")
+
+	return b.String()
+}
+
+// zzlHACK:END
