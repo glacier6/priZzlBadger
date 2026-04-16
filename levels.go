@@ -1438,29 +1438,88 @@ func (s *levelsController) fillTablesL0ToL0(cd *compactDef) bool {
 
 	top := cd.thisLevel.tables
 	var out []*table.Table
-	now := time.Now()
-	for _, t := range top { //遍历0层的table，选择可以合并压缩的table并填入到out
-		if t.Size() >= 2*cd.t.fileSz[0] { // 如果当前table的大小大于等于2倍的MemTableSize
-			// This file is already big, don't include it.
-			// 当前table的大小已经足够大了，不包含它
-			continue
-		}
-		if now.Sub(t.CreatedAt) < 10*time.Second {
-			// Just created it 10s ago. Don't pick for compaction.
-			// 10秒前刚刚创建的table。不要选择压缩合并。
-			continue
-		}
-		if _, beingCompacted := s.cstatus.tables[t.ID()]; beingCompacted { //并发控制
-			continue
-		}
-		out = append(out, t)
-	}
+	// zzlHACK:4803 L0贪吃蛇机制+避让尾部大SST
+	targetSize := int64(0.8 * float64(cd.t.fileSz[0])) // zzlTODO:需要确定这个0.8多少合适
+	accumulatedSize := int64(0)
 
-	if len(out) < 4 { //L0层待合并的满足条件的SST少于4个，就不合并了
-		// If we don't have enough tables to merge in L0, don't do it.
-		// 如果我们没有足够的表在L0中合并，就不要这样做。
+	if len(top) > 0 && top[0].Size() >= targetSize {
+		// 【模式A：高阶避让机制】
+		// 尾部 SST 已经满足下沉条件，但进到了 L0ToL0，说明 L0ToLbase 失败了 (底层被锁)。
+		// 为了防止写停顿，跳过尾部大文件，去中间寻找连续的小碎片进行合并。
+		for i := 0; i < len(top); i++ {
+			t := top[i]
+
+			// 并发控制：如果遇到正在被其他线程合并的表，或者遇到大表
+			if _, beingCompacted := s.cstatus.tables[t.ID()]; beingCompacted || t.Size() >= targetSize {
+				if len(out) > 0 {
+					// 致命底线：为了保证时间序列连续，一旦已经开始收集，遇到阻断必须 break！
+					break
+				}
+				// 还没开始收集，跳过它，继续往后找合适的起点
+				continue
+			}
+
+			// 找到符合条件的小表，开始连续收集
+			out = append(out, t)
+			accumulatedSize += t.Size()
+
+			// 无视重叠，强制叠加，够 0.8 就收手
+			if accumulatedSize >= targetSize {
+				break
+			}
+		}
+	} else {
+		// 【模式B：贪吃蛇打包机制】
+		// 尾部 SST 不够大，从尾部开始向前连续吃，直到吃够 0.8
+		for i := 0; i < len(top); i++ {
+			t := top[i]
+
+			// 并发控制
+			if _, beingCompacted := s.cstatus.tables[t.ID()]; beingCompacted {
+				if len(out) > 0 {
+					break // 保证连续性
+				}
+				continue
+			}
+
+			out = append(out, t)
+			accumulatedSize += t.Size()
+
+			if accumulatedSize >= targetSize {
+				break
+			}
+		}
+	}
+	// 如果只收集到了 1 个表，浪费 I/O，放弃合并，注意不能单单写>2的，否则可能会死锁（即当两个SST拼接大小够用的话，这里会返回false） zzlTODO:这里可以优化，判断如果累积的大小大于阈值，哪怕少数SST也允许合并！
+	if len(out) < 2 {
 		return false
 	}
+	// NOTE:下面这个原版的now主要是避免刚写入一个SST就立马触发向下层压缩，也时避免触发碎片化压缩的一个手段
+	// now := time.Now()
+	// for _, t := range top { //遍历0层的table，选择可以合并压缩的table并填入到out
+	// 	if t.Size() >= 2*cd.t.fileSz[0] { // 如果当前table的大小大于等于2倍的MemTableSize
+	// 		// This file is already big, don't include it.
+	// 		// 当前table的大小已经足够大了，不包含它
+	// 		continue
+	// 	}
+	// 	if now.Sub(t.CreatedAt) < 10*time.Second {
+	// 		// Just created it 10s ago. Don't pick for compaction.
+	// 		// 10秒前刚刚创建的table。不要选择压缩合并。
+	// 		continue
+	// 	}
+	// 	if _, beingCompacted := s.cstatus.tables[t.ID()]; beingCompacted { //并发控制
+	// 		continue
+	// 	}
+	// 	out = append(out, t)
+	// }
+
+	// if len(out) < 4 { //L0层待合并的满足条件的SST少于4个，就不合并了
+	// 	// If we don't have enough tables to merge in L0, don't do it.
+	// 	// 如果我们没有足够的表在L0中合并，就不要这样做。
+	// 	return false
+	// }
+	// zzlHACK:END
+
 	cd.thisRange = infRange
 	cd.top = out
 
@@ -1500,6 +1559,12 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 	if len(top) == 0 {
 		return false
 	}
+	// zzlHACK:4803 L0->Lbase 守门员机制，如果太小就先不触发下层合并 (低代价拦截)
+	targetSize := int64(0.8 * float64(cd.t.fileSz[0])) // zzlTODO:需要确定这个0.8应该是多少比较合适
+	if top[0].Size() < targetSize {
+		return false
+	}
+	// zzlHACK:END
 
 	var out []*table.Table
 	if len(cd.dropPrefixes) > 0 {
@@ -1545,6 +1610,7 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 }
 
 // zzlHACK:4803 专门为 98层 (Hot-Unordered) 定制的选表逻辑
+// zzlTODO:貌似目前L99层不会自动切分成多个SST？再考虑一下是否需要切分
 // 物理逻辑完全对标 L0 -> Lbase，安全处理重叠范围与并发锁
 func (s *levelsController) fillTablesL98(cd *compactDef) bool {
 	// 确保目标层绝对不能是 0 (我们的目标层是 99)
@@ -2105,7 +2171,8 @@ func (s *levelsController) doCompact(id int, p compactionPriority) error {
 		cd.thisLevel = s.levels[l] // zzlHACK:4803 在这里设置当前层对象
 		cd.nextLevel = s.levels[p.t.baseLevel]
 		if !s.fillTablesL0(&cd) { // NOTE:核心操作，L0 -> L0，L0 -> BASE，填充合并任务对象内的一些参数，且将当前合并任务记录到s.cstatus(注意每次只会增加一个合并任务，即找到能合并的，就直接记录并返回了)
-			return errFillTables
+			// NOTE:注意L0-L0同L0-LBASE也会消除不必要的key旧版！！
+			return errFillTables // 注意返回这个错误也无所谓，外层已经做了处理，说明本次合并不需要执行，会自动跳过
 		}
 		// zzlHACK:4803 增加hotTier选表逻辑
 	} else if l == 98 {

@@ -30,7 +30,7 @@ func main() {
 		WithMemTableSize(1 << 20). // 1MB，极速撑爆
 		WithBaseTableSize(1 << 20).
 		WithValueThreshold(32 << 10). // 缩小阈值，让大KV也参与流转
-		WithNumLevelZeroTables(1).    // 只要有1个L0表就触发合并
+		WithNumLevelZeroTables(5).    // 只要有1个L0表就触发合并
 		WithNumMemtables(5).
 		WithSyncWrites(false).
 		WithLogger(nil)
@@ -46,9 +46,9 @@ func main() {
 	// ==========================================
 	fmt.Println("\n>>> [阶段 1] 混沌写入与热点培养中 (制造数十万版本冲突)...")
 
-	const totalOps = 300000
-	const hotKeyCount = 500     // 只有50个热点Key，被疯狂覆写
-	const coldKeyCount = 200000 // 两万个冷数据，做背景干扰
+	const totalOps = 3000000
+	const hotKeyCount = 1000     // 只有50个热点Key，被疯狂覆写
+	const coldKeyCount = 2000000 // 两万个冷数据，做背景干扰
 
 	// 	const totalOps = 3000000
 	// const hotKeyCount = 1000    // 只有50个热点Key，被疯狂覆写
