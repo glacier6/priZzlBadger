@@ -46,9 +46,9 @@ func main() {
 	fmt.Println("\n>>> [阶段 1] 混沌写入与热点培养中 (强制大 KV 触发冷热 Vlog 分流)...")
 
 	// 💥 缩小总次数防止 truthMap OOM，但依然保持极高密度的冲突
-	const totalOps = 2000000
-	const hotKeyCount = 3000     // 只有200个热点Key，疯狂覆写，产生大量 Vlog 垃圾
-	const coldKeyCount = 1500000 // 两万个冷数据
+	const totalOps = 500000
+	const hotKeyCount = 2000    // 只有200个热点Key，疯狂覆写，产生大量 Vlog 垃圾
+	const coldKeyCount = 500000 // 两万个冷数据
 
 	for i := 0; i < totalOps; i++ {
 		isHot := rand.Intn(100) < 80 // 80% 的概率写热点数据
