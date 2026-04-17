@@ -127,6 +127,11 @@ type HeatmapManager struct {
 	flushCount int32 // 原子计数器，记录发生了多少次 Flush memtable
 
 	isDecaying int32 // 标记当前是否正在执行后台衰减（0=空闲，1=正在执行
+
+	// --- 【新增：异步采样通道】 ---
+	sampleCh  chan Key
+	stopCh    chan struct{} // 用于优雅关闭后台协程
+	DropCount int64         // 记录因为队列满而丢弃的样本数
 }
 
 // --- 【新增】：内存池管理器方法 ---
@@ -214,6 +219,8 @@ func NewHeatmapManager() *HeatmapManager {
 		StatsChunks:    make([][]RegionStats, 0),
 		FreeList:       make([]int32, 0),
 		flushThreshold: flushThreshold,
+		sampleCh:       make(chan Key, 100000),
+		stopCh:         make(chan struct{}),
 	}
 
 	rootStart := Key{}
@@ -226,8 +233,49 @@ func NewHeatmapManager() *HeatmapManager {
 
 	// 初始化快照组
 	m.hotZonesSnapshot.Store(make([]HotZone, 0))
-
+	go m.asyncProcessSamples()
 	return m
+}
+
+// NOTE:有损异步采样队列
+// RecordWriteAsync 极速异步记录写操作 (无锁、防阻塞)
+func (m *HeatmapManager) RecordWriteAsync(key Key) {
+	// 拷贝一份 Key，防止底层引擎复用 slice 导致后台消费时数据错乱！
+	// (Badger 的 Key 生命周期极短，这步 copy 必不可少)
+	kCopy := make(Key, len(key))
+	copy(kCopy, key)
+
+	select {
+	case m.sampleCh <- kCopy:
+		// 成功塞入队列
+	default:
+		atomic.AddInt64(&m.DropCount, 1)
+		// 💥 核心：如果并发太高导致队列满了，直接丢弃该样本！
+		// 对于热点统计来说，洪峰期的偶尔丢样完全不影响最终大盘。
+		// 宁可丢失统计精度，绝不阻塞用户真实的写入！
+	}
+}
+
+// asyncProcessSamples 后台慢慢消化采样队列
+func (m *HeatmapManager) asyncProcessSamples() {
+	for {
+		select {
+		case key := <-m.sampleCh:
+			// 从通道中拿出 Key，在这里执行你原来笨重的同步操作
+			if m.MotherTree != nil && m.MotherTree.Root != nil {
+				// 假设全是写操作 (isRead = false)
+				m.MotherTree.Root.SearchLeaf(key, false, m)
+			}
+		case <-m.stopCh:
+			// 收到关闭信号，退出协程
+			return
+		}
+	}
+}
+
+// 优雅关闭
+func (m *HeatmapManager) Close() {
+	close(m.stopCh)
 }
 
 // NOTE:核心逻辑：向蓄水池添加样本，现在下面这个是针对全局的，注意调用下面这个函数需要先找到目标叶子节点，并且确保当前Key在目标叶子节点的边界内（左闭右开）。

@@ -2507,7 +2507,10 @@ func (db *DB) LevelsToString() string {
 		// 		" StaleData: %s Target FileSize: ∞\n",
 		// 	hotOrdNum, h(hotOrdSize), h(int64(hotOrdStale))))
 	}
-	// zzlHACK:END
 	b.WriteString("Level Done\n")
+	b.WriteString(fmt.Sprintf(
+		"HeatTree统计因为阻塞丢弃的key个数（DropCount）: %d.",
+		db.zzlHeatmap.DropCount))
+	// zzlHACK:END
 	return b.String()
 }

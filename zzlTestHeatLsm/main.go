@@ -30,7 +30,7 @@ func main() {
 		WithMemTableSize(1 << 20). // 1MB，极速撑爆
 		WithBaseTableSize(1 << 20).
 		WithValueThreshold(32 << 10). // 缩小阈值，让大KV也参与流转
-		WithNumLevelZeroTables(5).    // 只要有1个L0表就触发合并
+		WithNumLevelZeroTables(5).
 		WithNumMemtables(5).
 		WithSyncWrites(false).
 		WithLogger(nil)
@@ -46,9 +46,9 @@ func main() {
 	// ==========================================
 	fmt.Println("\n>>> [阶段 1] 混沌写入与热点培养中 (制造数十万版本冲突)...")
 
-	const totalOps = 3000000
-	const hotKeyCount = 1000     // 只有50个热点Key，被疯狂覆写
-	const coldKeyCount = 2000000 // 两万个冷数据，做背景干扰
+	const totalOps = 200000
+	const hotKeyCount = 1000      // 热数据
+	const coldKeyCount = 20000000 // 冷数据，做背景干扰
 
 	// 	const totalOps = 3000000
 	// const hotKeyCount = 1000    // 只有50个热点Key，被疯狂覆写
@@ -75,8 +75,10 @@ func main() {
 			}
 			delete(truthMap, keyStr) // 同步删除真理账本
 		} else {
+			paddingBytes := make([]byte, 8192)
+			rand.Read(paddingBytes) // math/rand 直接生成纯随机字节
 			// 写入操作，Value 必须携带严格的 Version 标记，用于防范幽灵读
-			valStr := fmt.Sprintf("value_payload_version_%d_data_%s", i, stringsRepeat("A", 128))
+			valStr := fmt.Sprintf("value_payload_version_%d_data_%s", i, paddingBytes)
 			err = db.Update(func(txn *badger.Txn) error {
 				return txn.Set(key, []byte(valStr))
 			})
@@ -175,6 +177,7 @@ func main() {
 	// 打印一下当前的物理大盘，记录关机前的状态
 	fmt.Println("\n📊 关机前 LSM 树物理大盘：")
 	fmt.Println(db.LevelsToString())
+	fmt.Println(db.VlogStatsToString())
 
 	// ==========================================
 	// 5. 关机重启校验 (Durability / Manifest Check)
