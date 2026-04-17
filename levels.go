@@ -555,7 +555,7 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 		s.hotTierOrd.RUnlock()
 
 		// 假设 L99 超过 50MB 则触发驱逐
-		if size > (50 << 20) { // zzlTODO:还需要更改为动态的大小！
+		if size > (50 << 20) { // zzlTODO:还需要更改为动态的大小！主要看你打算给L99分配多大，以及L99的每个SST的大小
 			targets := s.levelTargets()
 			p := compactionPriority{
 				level: 99,
@@ -1089,7 +1089,9 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		// bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
 		if cd.nextLevel.level == 98 || cd.nextLevel.level == 99 {
 			// L98 和 L99 是热点层，文件大小我们直接复用 L1 层的基准大小即可
-			bopts.TableSize = uint64(cd.t.fileSz[1]) // zzlTODO:思考设置多大的SST大小
+			// zzlTODO:L98文件大小临时设L1层大小，实际上从Flush下来的SST一般都会大于L1层的文件大小，目前不要切割，可能会导致读很慢，需要测试
+			// zzlTODO:L99文件大小也需要考虑，看看怎么设置好，注意现在是在正常切割！且L99的SST严格按照Key范围不重叠，所以只需要考虑好这个大小上限设置为多少就可以！
+			bopts.TableSize = uint64(cd.t.fileSz[1]) // 思考设置多大的SST大小，这里设置的值会在下面的NewTableBuilder函数内乘以0.95转为tableCapacity并且应用在builder.ReachedCapacity()函数内
 		} else {
 			// 正常的 L0-L6 走原生逻辑
 			bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
@@ -1439,7 +1441,7 @@ func (s *levelsController) fillTablesL0ToL0(cd *compactDef) bool {
 	top := cd.thisLevel.tables
 	var out []*table.Table
 	// zzlHACK:4803 L0贪吃蛇机制+避让尾部大SST
-	targetSize := int64(0.8 * float64(cd.t.fileSz[0])) // zzlTODO:需要确定这个0.8多少合适
+	targetSize := int64(0.8 * float64(cd.t.fileSz[0])) // zzlNOTE:就这个0.8吧
 	accumulatedSize := int64(0)
 
 	if len(top) > 0 && top[0].Size() >= targetSize {
@@ -1490,10 +1492,16 @@ func (s *levelsController) fillTablesL0ToL0(cd *compactDef) bool {
 			}
 		}
 	}
-	// 如果只收集到了 1 个表，浪费 I/O，放弃合并，注意不能单单写>2的，否则可能会死锁（即当两个SST拼接大小够用的话，这里会返回false） zzlTODO:这里可以优化，判断如果累积的大小大于阈值，哪怕少数SST也允许合并！
+	// 如果只收集到了 1 个表，浪费 I/O，放弃合并，注意不能单单写>2的，否则可能会死锁（即当两个SST拼接大小够用的话，这里会返回false）
 	if len(out) < 2 {
 		return false
 	}
+	// 如果只收集到了 2~3 个表，且累积大小较小，暂缓合并
+	if len(out) < 4 && accumulatedSize < targetSize/2 {
+		return false
+	}
+	// NOTE:能执行到这里，说明要不表数>=4,要不就是现在累积的大小>=targetSize/2
+
 	// NOTE:下面这个原版的now主要是避免刚写入一个SST就立马触发向下层压缩，也时避免触发碎片化压缩的一个手段
 	// now := time.Now()
 	// for _, t := range top { //遍历0层的table，选择可以合并压缩的table并填入到out
@@ -1560,7 +1568,7 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 		return false
 	}
 	// zzlHACK:4803 L0->Lbase 守门员机制，如果太小就先不触发下层合并 (低代价拦截)
-	targetSize := int64(0.8 * float64(cd.t.fileSz[0])) // zzlTODO:需要确定这个0.8应该是多少比较合适
+	targetSize := int64(0.8 * float64(cd.t.fileSz[0])) // zzlNOTE:就这个0.8吧
 	if top[0].Size() < targetSize {
 		return false
 	}
@@ -1610,7 +1618,6 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 }
 
 // zzlHACK:4803 专门为 98层 (Hot-Unordered) 定制的选表逻辑
-// zzlTODO:貌似目前L99层不会自动切分成多个SST？再考虑一下是否需要切分
 // 物理逻辑完全对标 L0 -> Lbase，安全处理重叠范围与并发锁
 func (s *levelsController) fillTablesL98(cd *compactDef) bool {
 	// 确保目标层绝对不能是 0 (我们的目标层是 99)

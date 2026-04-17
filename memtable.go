@@ -495,7 +495,7 @@ loop:
 		vp.Offset = e.offset
 		vp.Fid = lf.fid
 
-		switch { // GO的switch默认会自动break，zzlTODO:下面是干什么的？待看，应该不是直接排除失效的KV把
+		switch { // GO的switch默认会自动break，下面这个switch是BadgerDB 保证 事务原子性 (Atomicity) 和 防崩溃恢复 (Crash Recovery)
 		case e.meta&bitTxn > 0:
 			txnTs := y.ParseTs(e.Key)
 			if lastCommit == 0 {
@@ -507,7 +507,7 @@ loop:
 			entries = append(entries, e)
 			vptrs = append(vptrs, vp)
 
-		case e.meta&bitFinTxn > 0:
+		case e.meta&bitFinTxn > 0: // 标记本次事务完整提交了
 			txnTs, err := strconv.ParseUint(string(e.Value), 10, 64)
 			if err != nil || lastCommit != txnTs {
 				break loop

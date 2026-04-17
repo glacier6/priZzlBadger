@@ -2415,7 +2415,7 @@ func (db *DB) LevelsToString() string {
 		// 1. 安全读取 L98 的信息
 		// ==========================
 		db.lc.hotTier.RLock()
-		hotNum := len(db.lc.hotTier.tables)
+		// hotNum := len(db.lc.hotTier.tables)
 		var hotSize int64
 		var hotStale uint32
 		for _, t := range db.lc.hotTier.tables {
@@ -2428,7 +2428,7 @@ func (db *DB) LevelsToString() string {
 		// 2. 安全读取 L99 的信息
 		// ==========================
 		db.lc.hotTierOrd.RLock()
-		hotOrdNum := len(db.lc.hotTierOrd.tables)
+		// hotOrdNum := len(db.lc.hotTierOrd.tables)
 		var hotOrdSize int64
 		var hotOrdStale uint32
 		for _, t := range db.lc.hotTierOrd.tables {
@@ -2436,16 +2436,76 @@ func (db *DB) LevelsToString() string {
 			hotOrdStale += t.StaleDataSize()
 		}
 		db.lc.hotTierOrd.RUnlock()
+		// zzlHACK:输出热层的情况与 SST 详细分布
+		if db.lc != nil && db.lc.hotTier != nil && db.lc.hotTierOrd != nil {
+			// ==========================
+			// 1. 安全读取 L98 的信息
+			// ==========================
+			db.lc.hotTier.RLock()
+			hotNum := len(db.lc.hotTier.tables)
+			var hotSize int64
+			var hotStale uint32
+			var hotDetails []string // 临时切片存放详情，避免长耗时字符串拼接阻塞读锁
 
+			for _, t := range db.lc.hotTier.tables {
+				hotSize += t.Size()
+				hotStale += t.StaleDataSize()
+				// 使用 y.ParseKey 剥离掉 Badger 的 8 字节 MVCC 时间戳，还原出纯净的 string
+				minKey := string(y.ParseKey(t.Smallest()))
+				maxKey := string(y.ParseKey(t.Biggest()))
+				hotDetails = append(hotDetails, fmt.Sprintf("    -> [SST %03d] Size: %-6s Range: [%s] ~ [%s]\n", t.ID(), h(t.Size()), minKey, maxKey))
+			}
+			db.lc.hotTier.RUnlock()
+
+			// ==========================
+			// 2. 安全读取 L99 的信息
+			// ==========================
+			db.lc.hotTierOrd.RLock()
+			hotOrdNum := len(db.lc.hotTierOrd.tables)
+			var hotOrdSize int64
+			var hotOrdStale uint32
+			var hotOrdDetails []string
+
+			for _, t := range db.lc.hotTierOrd.tables {
+				hotOrdSize += t.Size()
+				hotOrdStale += t.StaleDataSize()
+				minKey := string(y.ParseKey(t.Smallest()))
+				maxKey := string(y.ParseKey(t.Biggest()))
+				hotOrdDetails = append(hotOrdDetails, fmt.Sprintf("    -> [SST %03d] Size: %-6s Range: [%s] ~ [%s]\n", t.ID(), h(t.Size()), minKey, maxKey))
+			}
+			db.lc.hotTierOrd.RUnlock()
+
+			// ==========================
+			// 3. 统一将结果写入 Builder
+			// ==========================
+			// 打印 L98 汇总与子表详情
+			b.WriteString(fmt.Sprintf(
+				"Level 98 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
+					" StaleData: %s Target FileSize: ∞\n",
+				hotNum, h(hotSize), h(int64(hotStale))))
+			for _, detail := range hotDetails {
+				b.WriteString(detail)
+			}
+
+			// 打印 L99 汇总与子表详情
+			b.WriteString(fmt.Sprintf(
+				"Level 99 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
+					" StaleData: %s Target FileSize: ∞\n",
+				hotOrdNum, h(hotOrdSize), h(int64(hotOrdStale))))
+			for _, detail := range hotOrdDetails {
+				b.WriteString(detail)
+			}
+		}
+		// zzlHACK:END
 		// 完美复刻上面的打印格式，复用 h() 转换格式，容量展示为无穷大 (∞)
-		b.WriteString(fmt.Sprintf(
-			"Level 98 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
-				" StaleData: %s Target FileSize: ∞\n",
-			hotNum, h(hotSize), h(int64(hotStale))))
-		b.WriteString(fmt.Sprintf(
-			"Level 99 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
-				" StaleData: %s Target FileSize: ∞\n",
-			hotOrdNum, h(hotOrdSize), h(int64(hotOrdStale))))
+		// b.WriteString(fmt.Sprintf(
+		// 	"Level 98 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
+		// 		" StaleData: %s Target FileSize: ∞\n",
+		// 	hotNum, h(hotSize), h(int64(hotStale))))
+		// b.WriteString(fmt.Sprintf(
+		// 	"Level 99 [H]: NumTables: %02d. Size: %s of ∞. Score: 0.00->0.00"+
+		// 		" StaleData: %s Target FileSize: ∞\n",
+		// 	hotOrdNum, h(hotOrdSize), h(int64(hotOrdStale))))
 	}
 	// zzlHACK:END
 	b.WriteString("Level Done\n")

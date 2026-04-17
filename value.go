@@ -1194,7 +1194,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 // 		// [Aman] Should this be >= or just >? Doesn't make sense to extend the file if it big enough already.
 // 		//如果我们无法容纳此条目，请增加文件大小。
 // 		//[Aman]这应该是>=还是只是>？如果文件已经足够大，扩展它是没有意义的。
-// 		if int(endOffset) >= len(curlf.Data) { // zzlTODO:回来需要再去看看下面这里是干啥的，需要去看Ristretto的使用文档，看函数啥意思（大致是对mmap进行的截断操作）
+// 		if int(endOffset) >= len(curlf.Data) {
 // 			if err := curlf.Truncate(int64(endOffset)); err != nil {
 // 				return err
 // 			}
