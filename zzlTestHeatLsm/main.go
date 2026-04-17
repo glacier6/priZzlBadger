@@ -32,8 +32,7 @@ func main() {
 		WithValueThreshold(32 << 10). // 缩小阈值，让大KV也参与流转
 		WithNumLevelZeroTables(5).
 		WithNumMemtables(5).
-		WithSyncWrites(false).
-		WithLogger(nil)
+		WithSyncWrites(false)
 
 	db, err := badger.Open(opt)
 	if err != nil {
@@ -47,7 +46,7 @@ func main() {
 	fmt.Println("\n>>> [阶段 1] 混沌写入与热点培养中 (制造数十万版本冲突)...")
 
 	const totalOps = 200000
-	const hotKeyCount = 1000      // 热数据
+	const hotKeyCount = 500       // 热数据
 	const coldKeyCount = 20000000 // 冷数据，做背景干扰
 
 	// 	const totalOps = 3000000

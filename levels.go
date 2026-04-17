@@ -1087,14 +1087,17 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		// 将TableSize设置为该级别的目标文件大小。
 		// zzlHACK:4803 修复 nextLevel=99 时的数组越界
 		// bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
+		// NOTE:2026041701 注意分类压缩还有分类布隆都是在这里做
 		if cd.nextLevel.level == 98 || cd.nextLevel.level == 99 {
 			// L98 和 L99 是热点层，文件大小我们直接复用 L1 层的基准大小即可
 			// zzlTODO:L98文件大小临时设L1层大小，实际上从Flush下来的SST一般都会大于L1层的文件大小，目前不要切割，可能会导致读很慢，需要测试
 			// zzlTODO:L99文件大小也需要考虑，看看怎么设置好，注意现在是在正常切割！且L99的SST严格按照Key范围不重叠，所以只需要考虑好这个大小上限设置为多少就可以！
 			bopts.TableSize = uint64(cd.t.fileSz[1]) // 思考设置多大的SST大小，这里设置的值会在下面的NewTableBuilder函数内乘以0.95转为tableCapacity并且应用在builder.ReachedCapacity()函数内
+			// bopts.Compression = options.Snappy
 		} else {
 			// 正常的 L0-L6 走原生逻辑
 			bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
+			// bopts.Compression = options.ZSTD
 		}
 		// zzlHACK:END
 

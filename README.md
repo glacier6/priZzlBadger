@@ -8,7 +8,12 @@
   NOTE:2025060500 日志合并
   NOTE:2025112100 immemtable刷盘
   NOTE:2025111806 写落盘具体执行处
-  NOTE:2025121803 解密与解压缩,而加密在NOTE:2025121804
+  NOTE:2025121803 解密与解压缩,而加密在NOTE:2025121804，压缩在NOTE:2026041700
+
+  BadgerDB自身提供两种压缩算法(默认Snappy)，不同点如下：
+  压缩率： ZSTD 碾压 Snappy。
+  压缩速度：Snappy 碾压 ZSTD。
+  注意块缓存是已解密且已解压缩的
   
   看看DGraph与BadgerDB的托管模式是如何交互的？
   NOTE:2025112500 DGraph的alpha节点创建托管模式（管理模式）的BadgerDB对象所用的函数（实际就是通到上面那个NOTE:2025111800 DB初始化）

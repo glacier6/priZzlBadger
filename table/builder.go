@@ -164,6 +164,7 @@ func (b *Builder) handleBlock() {
 		blockBuf := item.data[:item.end]
 		// Compress the block.
 		if doCompress {
+			// zzlNOTE:2026041700 压缩块
 			out, err := b.compressData(blockBuf)
 			y.Check(err)
 			blockBuf = out

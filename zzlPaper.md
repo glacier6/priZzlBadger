@@ -1,11 +1,12 @@
 ### 实现!
 现在的那个热力图总共分为四个步骤实现
 1.构造出 hotTier *levelHandler  在 zzlHACK:4800 修改处
-2.compaction引流 在 zzlHACK:4801
+2.Flush引流 在 zzlHACK:4801
 3.查询流程修改 在 zzlHACK:4802
 4.compaction维护 zzlHACK:4803
 5.compaction跟踪 zzlHACK:4804
 6.有关GC的实现 zzlHACK:4160
+7.分类压缩和布隆 NOTE:2026041701 注意分类压缩还有分类布隆都是在这里做，但是分类压缩不要做了，没必要，主要是BadgerDB自身就是比较快的Snappy算法了，只会下降速度，而TODO:分类布隆下周再测试一下
 
 TODO:还要加hot层的自我合并(或者内存和并?)以及下放冷数据!!!!
 TODO:增加树衰减时如何减枝的操作!以及已经是高覆盖率的节点停止分裂

@@ -1223,7 +1223,11 @@ func arenaSize(opt Options) int64 {
 func buildFlushTables(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options, db *DB) (*table.Builder, *table.Builder) {
 	defer iter.Close()
 
-	// 准备两辆大巴车
+	// 准备两辆大巴车，NOTE:2026041701 注意分类压缩还有分类布隆都是在这里做
+	// coldBopts := bopts
+	// coldBopts.Compression = options.ZSTD
+	// hotBopts := bopts
+	// hotBopts.Compression = options.Snappy
 	coldBuilder := table.NewTableBuilder(bopts)
 	hotBuilder := table.NewTableBuilder(bopts)
 
