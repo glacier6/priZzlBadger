@@ -51,7 +51,6 @@ const (
 	flushThreshold = 1
 	// 目前不知道为啥,10000000条数据与操作时,为1和普通版本速度基本一致(频繁触发写入Hot),为4慢6%左右(触发写入Hot),为100慢3%左右(完全不触发写入Hot)
 
-	// TODO:停止高覆写率的节点的向下分裂，看看如何减枝
 )
 
 type Key []byte
@@ -773,7 +772,7 @@ func (n *HeatNode) SearchLeaf(key Key, isRead bool, m *HeatmapManager) *HeatNode
 		// SplitRangeKey 存储的是分割点（子节点的上界，左闭右开原则）
 		// 我们需要找到第一个 SplitKey > remainingKey 的位置 index
 		// 这样 remainingKey 就属于 Children[index]
-		idx := sort.Search(len(current.SplitRangeKey), func(i int) bool { // TODO:二分查找是if/else,而SplitRangeKey很小,是否需要顺序遍历以提速CPU
+		idx := sort.Search(len(current.SplitRangeKey), func(i int) bool {
 			// 比较：SplitKey > remainingKey
 			return bytes.Compare(current.SplitRangeKey[i], remainingKey) > 0
 		})
