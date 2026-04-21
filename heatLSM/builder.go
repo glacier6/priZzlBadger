@@ -16,12 +16,16 @@ import (
 )
 
 const (
-	// 蓄水池容量：叶子节点最多存多少个样本触发分裂检查
-	WReservoirCap = 256
+	// NOTE:蓄水池容量：叶子节点最多存多少个样本触发分裂检查，从4096倒着来/2或许不错，会在第四层达到最小值256
+	MinReservoirCap = 256
+	MaxReservoirCap = 1024
 
 	// 树节点分裂时，将蓄水池最多划分多少个有效范围
-	// TODO:这个设置为多少，更大会更方，整体查询效率也会更好
-	MaxValidRange = 4
+	// NOTE:先按照个数对所有有共享前缀的样本排名，然后依次去取最高的，先取4个（如果不够四个那就有多少个取多少个），然后再去判断后续的，如果后续的出现次数大于0.05，那么也算一个有效范围，
+	// 最小保底分裂分支数 (前 4 名无条件建国)
+	GuaranteedFanOut = 4
+	// 弹性扩招的密度阈值 (第 5 名开始，必须占当前蓄水池的 5% 以上)
+	MinPrefixRatio = 0.05
 
 	// --- 【新增】：分块内存池大小 ---
 	// 每次向系统申请连续存放 1024 个统计数据的物理内存块
@@ -36,14 +40,18 @@ const (
 	CurrentEpochWeight = 0.5
 
 	// 高低覆写率的分界线
-	// TODO:建议不要写死,写成排名制的？
-	HotRatioThreshold = 0.6
+	// NOTE:写成排名制的，然后最好还要关联每个节点具体的写入量！因为最终这个参数要控制的是进热层的数据量！
+	HotVolumePercentage = 0.20 // 1. 常规配额：取当期全局总Key量的前 20%
+	MinHotRatioFloor    = 0.30 // 2. 入场底线：覆写率低于 0.3 的，哪怕配额没满也绝对不要
+	HighHeatBypassRatio = 0.50 // 3. VVIP特权：覆写率 >= 0.5 的，哪怕配额满了也强行加座！
 
 	// 多少次memtable的转换触发一次衰减及更新高覆写率范围视图
-	// TODO:需要确定多少合适，小的话太频繁会使得HLL不断刷新，进而导致产生不了高覆写率的范围，大的话则更新不及时。需要结合HotRatioThreshold和CurrentEpochWeight决定
-	// TODO:特别是要结合HLL结构怎么刷新来考虑！
+	// NOTE:因为HLL依赖大数定律，所以要和热范围视图的更新频率区分开来，最好是与当前节点所处层级的那个分裂阈值SplitThreshold挂钩，比如只有HLL累积了SplitThreshold/4才代表本次采集结果具备有效性，允许更新！
+	// 但是随着每次纪元的结束,依旧会进行一次覆写率和高覆写快照的更新,只是不会重置HLL和EpochStartWrite.此外,需要注意的是,为了保证统计的有效性,当本轮HLL的write数小于1024时,跳过,避免冷启动污染
 	flushThreshold = 1
 	// 目前不知道为啥,10000000条数据与操作时,为1和普通版本速度基本一致(频繁触发写入Hot),为4慢6%左右(触发写入Hot),为100慢3%左右(完全不触发写入Hot)
+
+	// TODO:停止高覆写率的节点的向下分裂，看看如何减枝
 )
 
 type Key []byte
@@ -61,13 +69,14 @@ type HotZone struct {
 type RegionStats struct {
 	IsActive bool // 标记该槽位是否在使用中，方便复用
 
-	WriteCount int64 // 读写计数用int类型,这样在cpu内只需要执行一次自增即可,花费时间最少
+	WriteCount       uint32 // 读写计数用int类型,这样在cpu内只需要执行一次自增即可,花费时间最少
+	WindowStartWrite uint32 // (原 EpochStartWrite) 统计学窗口游标：用于 HLL 结算置信度
+	EpochStartWrite  uint32 // 本轮周期的开始时的写入量,WriteCount - EpochStartWrite等于当前周期的写入量
 
 	// 注意一起被计算的数据，就应该被存放在一起,所以下面这三个就放在一起好了
 	OverwriteRation float64 // 覆写率,NOTE:注意覆写率不能直接实时计算,所以这里的OverwriteRation实际是上一轮周期结束时的 本轮周期覆写率和上轮覆写率的权重合
 	// inheritOverwriteRation float64             // 从父节点或者上一轮周期继承的覆写率
-	EpochStartWrite int64               // 本轮周期的开始时的写入量,WriteCount - EpochStartWrite等于当前周期的写入量
-	CurrentHLL      *hyperloglog.Sketch // 用于覆写率
+	CurrentHLL *hyperloglog.Sketch // 用于覆写率
 
 	WSuffixReservoir []Key // 注意这个蓄水池在StatsChunks存储的是一个指针,并不是直接在StatsChunks内,所以遍历RegionStats的时候尽量不要碰这个,会导致cpu cache失效!
 }
@@ -82,12 +91,14 @@ type HeatNode struct {
 
 	// --- 结构控制 ---
 	IsLeaf        bool
-	Children      []*HeatNode // 这里使用有序切片存储子节点，分裂不固定为2,可为N个  TODO:这个Children和下面的SplitRangeKey的长度大小是否要直接固定,这样的话虽然空间变大,但是因为空间是连续的了,所以cpu cache会命中率很高
+	Children      []*HeatNode // 这里使用有序切片存储子节点，分裂不固定为2,可为N个  TODO:TODO:这个Children和下面的SplitRangeKey的长度大小是否要直接固定,这样的话虽然空间变大,但是因为空间是连续的了,所以cpu cache会命中率很高
 	SplitRangeKey []Key       // 分裂点列表，即Children中前【len(Children)-1】个的RangeEnd值（注意存的是逐层拼接的增量Key）
 
 	// --- 【核心重构：灵魂绑定】 ---
 	// 剥离了原本庞大的 Count 和 蓄水池，现在仅用一个 32 位整型指向内存池！
 	StatsID int32
+
+	ReservoirCap int
 
 	// 锁
 	sync.RWMutex
@@ -142,7 +153,7 @@ func (m *HeatmapManager) getStats(id int32) *RegionStats {
 }
 
 // AllocateStats 申请一块新的统计内存，优先复用空洞
-func (m *HeatmapManager) AllocateStats() int32 {
+func (m *HeatmapManager) AllocateStats(capacity int) int32 {
 	m.poolLock.Lock()
 	defer m.poolLock.Unlock()
 
@@ -154,6 +165,7 @@ func (m *HeatmapManager) AllocateStats() int32 {
 		stats.IsActive = true
 		stats.WriteCount = 0
 		stats.EpochStartWrite = 0
+		stats.WindowStartWrite = 0
 		stats.CurrentHLL = hyperloglog.New14() // 构造一个新的Sparse HLL
 		stats.OverwriteRation = 0.0            // 默认覆盖率等均为0,如果有遗传,那么外面再覆盖它
 
@@ -178,7 +190,7 @@ func (m *HeatmapManager) AllocateStats() int32 {
 		IsActive:         true,
 		CurrentHLL:       hyperloglog.New14(),
 		OverwriteRation:  0.0,
-		WSuffixReservoir: make([]Key, 0, WReservoirCap),
+		WSuffixReservoir: make([]Key, 0, capacity),
 	})
 
 	return int32(chunkIdx*StatsChunkSize + offset)
@@ -199,14 +211,22 @@ func (m *HeatmapManager) FreeStats(id int32) {
 
 // 创建一个新的节点 (重构：不再接收蓄水池，而是接收一个预分配好的 StatsID)
 func newHeatNode(Level int64, start, end Key, pathSeg Key, statsID int32) *HeatNode {
+	cap := MaxReservoirCap >> Level
+	if cap < MinReservoirCap {
+		cap = MinReservoirCap
+	}
 	n := &HeatNode{
 		Level:          Level,
-		SplitThreshold: 1 << (Level + 10), // TODO:目前第一层1024,第二层2048，第三层4096，需要根据实验调整
+		SplitThreshold: 1 << (Level + 10), // NOTE:目前第一层2048,第二层2048，第三层4096，后续继续*2
+		ReservoirCap:   cap,
 		RangeStart:     start,
 		RangeEnd:       end,
 		PathSegment:    pathSeg,
 		IsLeaf:         true,
 		StatsID:        statsID, // 绑定灵魂！
+	}
+	if Level == 0 {
+		n.SplitThreshold = 1 << 11
 	}
 	return n
 }
@@ -227,7 +247,7 @@ func NewHeatmapManager() *HeatmapManager {
 	rootEnd := Key(nil)
 
 	// 初始化母树
-	rootStatsID := m.AllocateStats()
+	rootStatsID := m.AllocateStats(MaxReservoirCap) // 根节点使用最大容量
 	motherRoot := newHeatNode(0, rootStart, rootEnd, Key{}, rootStatsID)
 	m.MotherTree = &HeatmapTree{Root: motherRoot}
 
@@ -279,7 +299,6 @@ func (m *HeatmapManager) Close() {
 }
 
 // NOTE:核心逻辑：向蓄水池添加样本，现在下面这个是针对全局的，注意调用下面这个函数需要先找到目标叶子节点，并且确保当前Key在目标叶子节点的边界内（左闭右开）。
-// TODO:看看是否有必要将近期查询KEY进入的可能性拉大
 // keySuffix: 已经剥离了当前节点 Prefix 的后缀部分
 // 【重构】：增加 manager 参数，以直接定位底层物理内存
 func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
@@ -298,8 +317,8 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
 	stats := m.getStats(n.StatsID)
 
 	stats.WriteCount++
-	stats.CurrentHLL.Insert(keySuffix)               // 喂给HLL,来算覆写率
-	if len(stats.WSuffixReservoir) < WReservoirCap { // 这里修复了你原代码中小 bug，写入应判断 WReservoirCap
+	stats.CurrentHLL.Insert(keySuffix)                // 喂给HLL,来算覆写率
+	if len(stats.WSuffixReservoir) < n.ReservoirCap { // 这里修复了你原代码中小 bug，写入应判断 WReservoirCap
 		k := make(Key, len(keySuffix))
 		copy(k, keySuffix)
 		stats.WSuffixReservoir = append(stats.WSuffixReservoir, k)
@@ -309,12 +328,12 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
 	limit := uint32(stats.WriteCount)
 	r := fastrand.Uint32n(limit)
 
-	if r < uint32(WReservoirCap) {
+	if r < uint32(n.ReservoirCap) {
 		k := make(Key, len(keySuffix))
 		copy(k, keySuffix)
 		stats.WSuffixReservoir[r] = k
 	}
-	if stats.WriteCount > n.SplitThreshold && len(stats.WSuffixReservoir) == WReservoirCap {
+	if stats.WriteCount > uint32(n.SplitThreshold) && len(stats.WSuffixReservoir) >= n.ReservoirCap {
 		n.Evolve(m) // 传入 manager
 	}
 	return
@@ -330,7 +349,7 @@ func (n *HeatNode) Evolve(m *HeatmapManager) {
 		return bytes.Compare(stats.WSuffixReservoir[i], stats.WSuffixReservoir[j]) < 0
 	})
 
-	PrefixGroups := FindTopNPrefixGroups(stats.WSuffixReservoir, MaxValidRange)
+	PrefixGroups := FindTopNPrefixGroups(stats.WSuffixReservoir)
 
 	sort.Slice(PrefixGroups, func(i, j int) bool {
 		return PrefixGroups[i].Start < PrefixGroups[j].Start
@@ -378,17 +397,22 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 	lastWRangeIndex := 0
 	currentWRangeIndex := 0
 	rangeWriteCount := float64(stats.WriteCount)
+	// 计算出下一层子节点的样本池容量
+	childCap := MaxReservoirCap >> nextLevel
+	if childCap < MinReservoirCap {
+		childCap = MinReservoirCap
+	}
 
 	// 下面这个if先计算出当前父节点的覆写率
-	epochWrites := stats.WriteCount - stats.EpochStartWrite // 算出本周期真实的写入量
-	if epochWrites > 0 {
+	windowWrites := stats.WriteCount - stats.WindowStartWrite // 算出本周期真实的写入量
+	if windowWrites >= uint32(MinReservoirCap) {
 		uniqueKeys := float64(stats.CurrentHLL.Estimate())
-		fatherCurentOverwriteRation := 1.0 - (uniqueKeys / float64(epochWrites))
+		fatherCurentOverwriteRation := 1.0 - (uniqueKeys / float64(windowWrites))
 		fatherOverwriteRation = fatherCurentOverwriteRation*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight) // 计算出当前父节点的覆写率
 		// 随着每衰退一轮,就计算一次覆写率,计算的同时清空HLL
 	} else {
-		// 虽然一般到分裂了,不会出现epochWrites等于0,但是还是加一个防卫一下吧
-		fatherOverwriteRation = 0.0*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
+		// 样本不足（或者刚好被清空过，或者一条没写），无条件信任历史稳态分数！
+		fatherOverwriteRation = stats.OverwriteRation
 	}
 	if fatherOverwriteRation < 0 {
 		fatherOverwriteRation = 0
@@ -406,16 +430,21 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 			}
 
 			// 【重构核心】：为新的间隙节点向大内存池申请一块空间
-			frontChildStatsID := m.AllocateStats()
+			frontChildStatsID := m.AllocateStats(childCap)
 			frontChildStats := m.getStats(frontChildStatsID)
-			frontChildStats.WriteCount = int64(rangeWriteCount * wRangeRation)
+			frontChildStats.WriteCount = uint32(rangeWriteCount * wRangeRation)
 			frontChildStats.EpochStartWrite = frontChildStats.WriteCount
+			frontChildStats.WindowStartWrite = frontChildStats.WriteCount
 			if frontChildStats.WriteCount > 0 {
 				frontChildStats.OverwriteRation = fatherOverwriteRation
 			}
 
 			// 继承并拷贝对应的蓄水池数据 (因为是间隙节点，无公共前缀，不需要剥离)
 			for _, key := range WSuffixReservoir[lastWRangeIndex:currentWRangeIndex] {
+				// 💥 【新增】：容量截断保护，防止继承超过自身物理上限！
+				if len(frontChildStats.WSuffixReservoir) >= childCap {
+					break
+				}
 				k := make(Key, len(key))
 				copy(k, key)
 				frontChildStats.WSuffixReservoir = append(frontChildStats.WSuffixReservoir, k)
@@ -432,10 +461,11 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 		wRangeRation, currentWRangeIndex = CalculateRangeRatio(lastWRangeIndex, childRangeEnd, WSuffixReservoir)
 
 		// 【重构核心】：为当前具有公共前缀的有效区间申请空间
-		childStatsID := m.AllocateStats()
+		childStatsID := m.AllocateStats(childCap)
 		childStats := m.getStats(childStatsID)
-		childStats.WriteCount = int64(rangeWriteCount * wRangeRation)
+		childStats.WriteCount = uint32(rangeWriteCount * wRangeRation)
 		childStats.EpochStartWrite = childStats.WriteCount
+		childStats.WindowStartWrite = childStats.WriteCount
 		if childStats.WriteCount > 0 {
 			childStats.OverwriteRation = fatherOverwriteRation
 		}
@@ -443,6 +473,10 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 		// 重点：剥离前缀！(oneRange.CommonPrefix)
 		pathSegLen := len(oneRange.CommonPrefix)
 		for _, key := range WSuffixReservoir[lastWRangeIndex:currentWRangeIndex] {
+			// 💥 【新增】：容量截断保护，防止继承超过自身物理上限！
+			if len(childStats.WSuffixReservoir) >= childCap {
+				break
+			}
 			if len(key) >= pathSegLen {
 				suffix := key[pathSegLen:]
 				k := make(Key, len(suffix))
@@ -475,15 +509,19 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 			wRangeRation, currentWRangeIndex = CalculateRangeRatio(lastWRangeIndex, afterChildRangeEnd, WSuffixReservoir)
 
 			// 申请尾部间隙空间
-			afterChildStatsID := m.AllocateStats()
+			afterChildStatsID := m.AllocateStats(childCap)
 			afterChildStats := m.getStats(afterChildStatsID)
-			afterChildStats.WriteCount = int64(rangeWriteCount * wRangeRation)
+			afterChildStats.WriteCount = uint32(rangeWriteCount * wRangeRation)
 			afterChildStats.EpochStartWrite = afterChildStats.WriteCount
+			afterChildStats.WindowStartWrite = afterChildStats.WriteCount
 			if afterChildStats.WriteCount > 0 {
 				afterChildStats.OverwriteRation = fatherOverwriteRation
 			}
 
 			for _, key := range WSuffixReservoir[lastWRangeIndex:currentWRangeIndex] {
+				if len(afterChildStats.WSuffixReservoir) >= childCap {
+					break
+				}
 				k := make(Key, len(key))
 				copy(k, key)
 				afterChildStats.WSuffixReservoir = append(afterChildStats.WSuffixReservoir, k)
@@ -501,10 +539,19 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 	return children, splitKeys
 }
 
+// 💥 【新增】：用于快照排位赛的候选人结构
+type zoneCandidate struct {
+	Start  Key
+	End    Key
+	Ratio  float64
+	Volume uint64 // 记录该区间当前的物理体积（通过 HLL 的 Unique Keys 估算）
+}
+
 // 下面是触发衰减以及更新高覆写率的视图
 func (m *HeatmapManager) EpochDecayAndSnapshot() {
 	var newZones []HotZone
-
+	var candidates []zoneCandidate
+	var globalEpochVolume uint64 = 0 // 💥 记录本周期的全局总物理体积
 	m.evolutionLock.Lock()
 	defer m.evolutionLock.Unlock()
 
@@ -556,27 +603,57 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 
 		if isLeaf && statsID != -1 {
 			stats := m.getStats(node.StatsID)
-
+			windowWrites := stats.WriteCount - stats.WindowStartWrite
 			epochWrites := stats.WriteCount - stats.EpochStartWrite
-			if epochWrites > 0 {
-				uniqueKeys := float64(stats.CurrentHLL.Estimate())
-				currentRatio := 1.0 - (uniqueKeys / float64(epochWrites))
-				stats.OverwriteRation = currentRatio*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
-			} else {
-				stats.OverwriteRation = 0.0*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
-			}
-			if stats.OverwriteRation < 0 {
-				stats.OverwriteRation = 0
-			}
-
 			stats.EpochStartWrite = stats.WriteCount
-			stats.CurrentHLL = hyperloglog.New14()
 
-			if stats.OverwriteRation >= HotRatioThreshold {
-				// 💥 修复核心：存入快照的必须是刚拼装好的【绝对路径】！
-				newZones = append(newZones, HotZone{
-					Start: absStart,
-					End:   absEnd,
+			// 获取动态自适应结算门槛 (必须攒够节点寿命的 1/4)
+			minEpochWrites := uint32(node.SplitThreshold / 4)
+			if minEpochWrites < uint32(MinReservoirCap) {
+				minEpochWrites = uint32(MinReservoirCap)
+			}
+
+			currentUniqueKeys := float64(stats.CurrentHLL.Estimate())
+			volume := uint64(currentUniqueKeys)
+			// NOTE:累加当前节点的物理体积到全局总盘子
+			globalEpochVolume += volume
+			if epochWrites > 0 {
+				// NOTE:置信度闸门 (Confidence Gate)
+				// 只有当新窗口积累了足够的底线样本（MinReservoirCap），算出的暂态覆写率才有意义。
+				// 如果样本太少，直接跳过 EWMA 计算，完美信任它的历史分数，绝不让冷启动引发暴跌！
+				if windowWrites >= uint32(MinReservoirCap) {
+					currentRatio := 1.0 - (currentUniqueKeys / float64(windowWrites))
+					stats.OverwriteRation = currentRatio*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
+
+					if stats.OverwriteRation < 0 {
+						stats.OverwriteRation = 0
+					}
+				}
+				// NOTE:只有真正攒够了样本，才允许清空 HLL 开启下次统计！
+				if windowWrites >= minEpochWrites {
+					stats.WindowStartWrite = stats.WriteCount
+					stats.CurrentHLL = hyperloglog.New14()
+				}
+			} else {
+				// 没有写入,只需要衰减
+				stats.OverwriteRation = 0.0*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
+				// 💥 幽灵体积回收机制 (Ghost GC)
+				// 既然彻底没人写了，如果它的分数已经跌到完全不可能进热区了（比如跌破 0.05），
+				// 强制清空它的 HLL！防止它这辈子永远用旧数据污染 globalEpochVolume！
+				if stats.OverwriteRation < 0.05 {
+					stats.OverwriteRation = 0
+					stats.WindowStartWrite = stats.WriteCount
+					stats.CurrentHLL = hyperloglog.New14()
+				}
+			}
+
+			// NOTE:底线过滤：0.3 以下直接淘汰，0.3 及以上的进入排位海选
+			if stats.OverwriteRation >= MinHotRatioFloor {
+				candidates = append(candidates, zoneCandidate{
+					Start:  absStart,
+					End:    absEnd,
+					Ratio:  stats.OverwriteRation,
+					Volume: volume,
 				})
 			}
 		}
@@ -588,17 +665,44 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 		}
 	}
 
-	// 1. 发起一体化遍历，根节点的前缀为空，边界为绝对的全域 [-∞, +∞)
+	// 发起一体化遍历，根节点的前缀为空，边界为绝对的全域 [-∞, +∞)
 	if m.MotherTree != nil && m.MotherTree.Root != nil {
 		traverse(m.MotherTree.Root, Key{}, Key{}, Key(nil))
 	}
+	// 排位赛:带 VVIP 特权的弹性配额截断算法
+	// A. 计算本次衰减周期的常规物理配额 (例如总盘子的 20%)
+	targetQuota := uint64(float64(globalEpochVolume) * HotVolumePercentage)
+	var currentAdmittedVolume uint64 = 0
 
-	// 2. 将收集到的热区排序（二分查找的先决条件）
+	// B. 按覆写率从大到小降序排名 (最热的排前面抢名额)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Ratio > candidates[j].Ratio
+	})
+
+	// C. 依次发放入场券，执行 VVIP 特权逻辑
+	for _, c := range candidates {
+		if currentAdmittedVolume+c.Volume > targetQuota {
+			// 常规配额已满！开启 VVIP 检查
+			if c.Ratio < HighHeatBypassRatio {
+				// 配额已满，且热度不足以触发特权，果断关门！
+				break
+			}
+			// 💥 触发特权：虽然配额满了，但覆写率极其爆表，必须强行加座！
+		}
+
+		newZones = append(newZones, HotZone{
+			Start: c.Start,
+			End:   c.End,
+		})
+		currentAdmittedVolume += c.Volume
+	}
+
+	// 将收集到的热区排序（二分查找的先决条件）,供给底层 IsHotKey 的二分查找使用
 	sort.Slice(newZones, func(i, j int) bool {
 		return bytes.Compare(newZones[i].Start, newZones[j].Start) < 0
 	})
 
-	// 3. RCU 原子替换
+	// RCU 原子替换
 	m.hotZonesSnapshot.Store(newZones)
 }
 

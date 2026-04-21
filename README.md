@@ -51,6 +51,7 @@
       PS:注意 db.indexCache 在创建之后，会在数据库初始化时进行SST在内存中的对象创建时（NOTE:2025122302）通过创建的topt对象（NOTE:2025122301）赋值给SST
       PS：indexCache的使用都是通过 fetchIndex 函数使用的。（NOTE:2025122303，注意这个函数在下面 第16条 查询时的 4 5 6 步都有用）
       PS：注意SST的范围是在Levelhandler（内存）中存着的，所以是先根据此找到目标SST，然后再加载目标SST的索引块来判断布隆
+      PS：注意布隆的那个bit串会随着key增加而以一个固定比例（这个主要看假阳率多少）来增加
     - 7.2 db.blockCache增加以及查询的时机在  
       查询完memtable以及immemtable后未找到，遍历层去找，每层找出可能存在目标K的SST（注意在此会用布隆），然后再在SST内查找（得到目标块的idx），再依据目标块的idx来查缓存以及添加缓存  
 

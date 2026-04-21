@@ -99,7 +99,7 @@ func TestHeatNode_Evolve_Integration(t *testing.T) {
 		var readCount int64 = 0
 		if leaf.StatsID != -1 {
 			stats := manager.getStats(leaf.StatsID)
-			readCount = stats.WriteCount
+			readCount = int64(stats.WriteCount)
 		}
 
 		fmt.Printf("Key [%s] routed to Leaf with PathSegment [%s], Level: [%d], Range:[%s-%s), WriteCount: %d\n",

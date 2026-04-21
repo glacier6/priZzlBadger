@@ -1225,8 +1225,10 @@ func buildFlushTables(iter y.Iterator, dropPrefixes [][]byte, bopts table.Option
 
 	// 准备两辆大巴车，NOTE:2026041701 注意分类压缩还有分类布隆都是在这里做
 	// coldBopts := bopts
+	// coldBopts.BloomFalsePositive = 0.01
 	// coldBopts.Compression = options.ZSTD
 	// hotBopts := bopts
+	// hotBopts.BloomFalsePositive = 0.001
 	// hotBopts.Compression = options.Snappy
 	coldBuilder := table.NewTableBuilder(bopts)
 	hotBuilder := table.NewTableBuilder(bopts)

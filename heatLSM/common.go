@@ -73,14 +73,11 @@ func getByteAt(k Key, index int) int16 {
 	return int16(k[index])
 }
 
-// FindTopNPrefixGroups 寻找包含 Key 最多的前 n 个公共前缀区间
+// FindDensePrefixGroups 结合了 Top-K 保底与密度弹性的分裂算法
 // keys: 必须是按字典序排好序的
 // n: 需要返回的区间个数
-func FindTopNPrefixGroups(keys []Key, n int) []ResIndexRange {
+func FindTopNPrefixGroups(keys []Key) []ResIndexRange {
 	if len(keys) == 0 {
-		return nil
-	}
-	if n <= 0 {
 		return nil
 	}
 
@@ -123,11 +120,23 @@ func FindTopNPrefixGroups(keys []Key, n int) []ResIndexRange {
 		return groups[i].Count > groups[j].Count
 	})
 
-	// 5. 如果分组不足 n 个，直接返回所有；否则返回前 n 个
-	if len(groups) > n {
-		return groups[:n]
+	// 5. 保底 n 个 + 5% 密度弹性扩招
+	var validGroups []ResIndexRange
+	totalSamples := len(keys)
+	densityThreshold := int(float64(totalSamples) * MinPrefixRatio)
+
+	for i, group := range groups {
+		// 条件 1：如果是前 4 名（保底录取）
+		// 条件 2：如果超过 4 名，但频次达到了 5% 密度线（弹性扩招）
+		if i < GuaranteedFanOut || group.Count >= densityThreshold {
+			validGroups = append(validGroups, group)
+		} else {
+			// 因为 groups 已经是降序排列了，一旦遇到不满足条件的，
+			// 后面的肯定更小，直接 break 提前结束，节省 CPU！
+			break
+		}
 	}
-	return groups
+	return validGroups
 }
 
 // CalculateRangeRatio 计算区间 [lastSplitKey（下标为lastSplitIndex）, currentSplitKey) 在写入蓄水池中占据的比例
