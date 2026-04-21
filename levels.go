@@ -553,9 +553,18 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 		s.hotTierOrd.RLock()
 		size := s.hotTierOrd.totalSize
 		s.hotTierOrd.RUnlock()
+		// 💥 1. 获取最后一层（L6）的当前物理总大小
+		// BadgerDB 的 levelHandler 提供了 getTotalSize() 方法
+		lmaxSize := s.lastLevel().getTotalSize()
 
-		// 假设 L99 超过 50MB 则触发驱逐
-		if size > (50 << 20) { // zzlTODO:还需要更改为动态的大小！主要看你打算给L99分配多大，以及L99的每个SST的大小
+		// 💥 2. 计算动态阈值：Lmax 层的 15%
+		dynamicThreshold := int64(float64(lmaxSize) * 0.15)
+
+		if dynamicThreshold < (50 << 20) {
+			dynamicThreshold = 50 << 20
+		}
+
+		if size > dynamicThreshold { // NOTE:更改为L6层(即当前总容量)的20%,符合二八定律
 			targets := s.levelTargets()
 			p := compactionPriority{
 				level: 99,
@@ -579,6 +588,7 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 			prios = moveL0toFront(prios) // 提高L0层的优先级
 		}
 		for _, p := range prios { //遍历这个待压缩层切片（这个切片已经按照调整分数adjusted大小排过序了），并取出来每层对应的优先级对象 p
+			// NOTE:注意对于0和1号协程,如果因为锁无法执行L0和L98层的合并,也会在这里执行其他层的合并任务,并不会闲着(可能L98自我合并并未开启)
 			if id == 0 && p.level == 0 {
 				// Allow worker zero to run level 0, irrespective of its adjusted score.
 				// 让0号协程去处理L0层，不用管调整后的分数（优先级）是如何的
@@ -628,6 +638,168 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 	}
 }
 
+// zzlHACK:4210
+// id表示的是当前协程编号（从0开始编号，默认0，1，2，3四个协程）
+// func (s *levelsController) runCompactor(id int, lc *z.Closer) {
+// 	defer lc.Done() //做协程的并发控制（应该是关闭协程）
+
+// 	randomDelay := time.NewTimer(time.Duration(rand.Int31n(1000)) * time.Millisecond) // 创建一个0~1000ms的随即延迟，使得各个协程执行的时间岔开，即是为了减少协程之间的冲突，来提高并发
+// 	// 计时结束，NewTimer函数会自动向randomDelay.C写入一个数据
+// 	select {
+// 	case <-randomDelay.C: //能取出这个数的话，代表计时到了,取不出来就一直阻塞
+// 	case <-lc.HasBeenClosed(): //当调用Signal（）时，HasBeenColosed会收到信号。然后在这里就会有可以从chan中取得数据，就会把计时器关闭
+// 		randomDelay.Stop()
+// 		return
+// 	}
+
+// 	//将L0层的优先级提前
+// 	moveL0toFront := func(prios []compactionPriority) []compactionPriority {
+// 		idx := -1
+// 		for i, p := range prios {
+// 			if p.level == 0 {
+// 				idx = i // 找到L0层在优先级数组的下标
+// 				break
+// 			}
+// 		}
+// 		// If idx == -1, we didn't find L0.
+// 		// If idx == 0, then we don't need to do anything. L0 is already at the front.
+// 		// 如果idx==-1，我们找不到L0。
+// 		// 如果idx==0，那么我们不需要做任何事情。L0已经在前面了。
+// 		if idx > 0 {
+// 			out := append([]compactionPriority{}, prios[idx])
+// 			out = append(out, prios[:idx]...)
+// 			out = append(out, prios[idx+1:]...)
+// 			return out
+// 		}
+// 		return prios
+// 	}
+// 	// zzlHACK:4803 将L98层的优先级提前 (专供1号协程使用)
+// 	moveL98toFront := func(prios []compactionPriority) []compactionPriority {
+// 		idx := -1
+// 		for i, p := range prios {
+// 			if p.level == 98 {
+// 				idx = i
+// 				break
+// 			}
+// 		}
+// 		if idx > 0 {
+// 			out := append([]compactionPriority{}, prios[idx])
+// 			out = append(out, prios[:idx]...)
+// 			out = append(out, prios[idx+1:]...)
+// 			return out
+// 		}
+// 		return prios
+// 	}
+// 	// 这个函数是合并的基本函数，其在跳层合并以及普通合并中都会用到，p里面存着从哪压缩到哪
+// 	run := func(p compactionPriority) bool {
+// 		err := s.doCompact(id, p) // NOTE:核心操作，执行压缩器
+// 		switch err {
+// 		case nil:
+// 			return true
+// 		case errFillTables:
+// 			// pass
+// 		default:
+// 			s.kv.opt.Warningf("While running doCompact: %v\n", err)
+// 		}
+// 		return false
+// 	}
+
+// 	// zzlHACK:3号协程负责99层冷数据下放，而所有协程都可以做98层的碎片整理（通过下面的runOnce函数）
+// 	tryHotTierOrdEviction := func() {
+// 		s.hotTierOrd.RLock()
+// 		size := s.hotTierOrd.totalSize
+// 		s.hotTierOrd.RUnlock()
+// 		// 💥 1. 获取最后一层（L6）的当前物理总大小
+// 		// BadgerDB 的 levelHandler 提供了 getTotalSize() 方法
+// 		lmaxSize := s.lastLevel().getTotalSize()
+
+// 		// 💥 2. 计算动态阈值：Lmax 层的 15%
+// 		dynamicThreshold := int64(float64(lmaxSize) * 0.15)
+
+// 		if dynamicThreshold < (50 << 20) {
+// 			dynamicThreshold = 50 << 20
+// 		}
+
+// 		if size > dynamicThreshold { // NOTE:更改为L6层(即当前总容量)的20%,符合二八定律
+// 			targets := s.levelTargets()
+// 			p := compactionPriority{
+// 				level: 99,
+// 				t:     targets,
+// 			}
+// 			s.kv.opt.Infof("HotTier L99 is full (%d MB), triggering eviction to L%d\n",
+// 				size/(1<<20), targets.baseLevel)
+// 			run(p)
+// 		}
+// 	}
+// 	// zzlHACK:END
+
+// 	var priosBuffer []compactionPriority // 合并优先级数组
+// 	runOnce := func() bool {
+// 		prios := s.pickCompactLevels(priosBuffer) // NOTE: 核心操作，计算出当前的 待压缩层 切片，里面包含哪些层目前需要压缩，且按优先级（adjusted）顺序排序
+// 		defer func() {
+// 			priosBuffer = prios
+// 		}()
+// 		if id == 0 {
+// 			// 0号协程对压缩L0层进行特殊操作，只让0号协程处理L0层
+// 			prios = moveL0toFront(prios) // 提高L0层的优先级
+// 		} else if id == 1 {
+// 			// zzlHACK: 1号协程专门处理L98，强制提升L98的优先级
+// 			prios = moveL98toFront(prios)
+// 		}
+// 		for _, p := range prios { //遍历这个待压缩层切片（这个切片已经按照调整分数adjusted大小排过序了），并取出来每层对应的优先级对象 p
+// 			// NOTE:注意对于0和1号协程,如果因为锁无法执行L0和L98层的合并,也会在这里执行其他层的合并任务,并不会闲着
+// 			if id == 0 && p.level == 0 {
+// 				// Allow worker zero to run level 0, irrespective of its adjusted score.
+// 				// 让0号协程去处理L0层，不用管调整后的分数（优先级）是如何的
+// 			} else if p.level == 98 && id == 1 {
+// 				// 让1号协程去处理L98层，不用管调整后的分数（优先级）是如何的
+// 			} else if p.adjusted < 1.0 { //如果调整分数小于1，不进行压缩
+// 				break
+// 			}
+// 			if run(p) { //已得到需要合并的层级，跳到合并执行函数
+// 				return true
+// 			}
+// 		}
+
+// 		return false
+// 	}
+
+// 	// 最底层自我合并
+// 	tryLmaxToLmaxCompaction := func() {
+// 		p := compactionPriority{ //合并优先级对象
+// 			level: s.lastLevel().level, //获取最后一层的层号（第6层）
+// 			t:     s.levelTargets(),
+// 		}
+// 		run(p)
+
+// 	}
+
+// 	count := 0                                      // 专用于2号合并协程的计数器，达到200执行tryLmaxToLmaxCompaction
+// 	hotCount := 0                                   // 3号协程专用计数器 zzlHACK:4803
+// 	ticker := time.NewTicker(50 * time.Millisecond) //创建一个50ms的时钟
+// 	defer ticker.Stop()
+// 	for { //无限循环
+// 		select {
+// 		// Can add a done channel or other stuff.
+// 		case <-ticker.C: //每50ms执行一次合并 ，上面那几个闭包函数合并时在时间上一般的执行顺序（需要看的顺序）为runOnce（），moveL0toFront（），run（），tryLmaxToLmaxCompaction（）
+// 			count++
+// 			// Each ticker is 50ms so 50*200=10seconds.
+// 			if s.kv.opt.LmaxCompaction && id == 2 && count >= 200 { // 注意只有2号协程才会执行底层自我合并的操作，且每10秒才会执行一次这个操作（LmaxCompaction参数控制这个功能是否开启）
+// 				tryLmaxToLmaxCompaction() //执行最底层自我合并
+// 				count = 0
+// 			} else if id == 3 && hotCount >= 100 { // zzlHACK:4803 多一个else if，让3号协程专门处理99层冷数据下放，所有协程都可以处理98-99层的碎片整理
+// 				tryHotTierOrdEviction()
+// 				hotCount = 0
+// 			} else {
+// 				runOnce() //其余的进行普通的压缩
+// 			}
+// 		case <-lc.HasBeenClosed(): //或者有通知要关闭的时候，关闭掉
+// 			return
+// 		}
+// 	}
+// }
+
+// zzlHACK:4210 END
 type compactionPriority struct {
 	level        int
 	score        float64
@@ -739,7 +911,7 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 		s.hotTier.RUnlock()
 
 		// 触发阈值：当 L98 的碎文件达到一定数量 (比如 10 个)
-		if l98Count >= 5 { // zzlTODO:动态或者再想想决定这个数量
+		if l98Count >= 5 { // zzlTODO:看看有没有必要拉大,就是当1号协程管理不过来了,拉过来一个帮忙的来处理L98-L99(注意L98-L98只能由1号协程来做)
 			prios = append(prios, compactionPriority{
 				level:    98,
 				score:    2.0,   // 给个及格分数即可
@@ -837,6 +1009,19 @@ func (s *levelsController) checkOverlap(tables []*table.Table, lev int, currentL
 			}
 		}
 	}
+	// zzlHACK:4210
+	// if currentLev == 98 && lev == 99 {
+	// 	// 因为外边的lev = cd.nextLevel.level+1,所以如果lev == 99就代表了是98层的自我合并,需要额外检查L99层的重叠情况
+	// 	if s.hotTierOrd != nil {
+	// 		s.hotTierOrd.RLock()
+	// 		left, right := s.hotTierOrd.overlappingTables(levelHandlerRLocked{}, kr)
+	// 		s.hotTierOrd.RUnlock()
+	// 		if right-left > 0 {
+	// 			return true // 热树里有旧数据，墓碑保留！
+	// 		}
+	// 	}
+	// }
+	// zzlHACK:4210 END
 	// zzlHACK:END
 	return false
 }
@@ -1090,9 +1275,9 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		// NOTE:2026041701 注意分类压缩还有分类布隆都是在这里做
 		if cd.nextLevel.level == 98 || cd.nextLevel.level == 99 {
 			// L98 和 L99 是热点层，文件大小我们直接复用 L1 层的基准大小即可
-			// zzlTODO:L98文件大小临时设L1层大小，实际上从Flush下来的SST一般都会大于L1层的文件大小，目前不要切割，可能会导致读很慢，需要测试
-			// zzlTODO:L99文件大小也需要考虑，看看怎么设置好，注意现在是在正常切割！且L99的SST严格按照Key范围不重叠，所以只需要考虑好这个大小上限设置为多少就可以！
-			bopts.TableSize = uint64(cd.t.fileSz[1]) // 思考设置多大的SST大小，这里设置的值会在下面的NewTableBuilder函数内乘以0.95转为tableCapacity并且应用在builder.ReachedCapacity()函数内
+			// NOTE:L99和L98文件大小和L0保持一致.
+			bopts.TableSize = uint64(cd.t.fileSz[0]) // 这里设置的值会在下面的NewTableBuilder函数内乘以0.95转为tableCapacity并且应用在builder.ReachedCapacity()函数内
+
 			// bopts.BloomFalsePositive = 0.001
 			// bopts.Compression = options.Snappy
 		} else {
@@ -1685,6 +1870,179 @@ func (s *levelsController) fillTablesL98(cd *compactDef) bool {
 	// 如果此时有其他协程正在动 cd.nextRange 这块地盘，compareAndAdd 会返回 false 放弃合并
 	return s.cstatus.compareAndAdd(thisAndNextLevelRLocked{}, *cd)
 }
+
+// zzlHACK:4210 替换上面这个fillTablesL98函数即可
+// func (s *levelsController) fillTablesL98(cd *compactDef) bool {
+// 	// 优先尝试将 L98 沉入 L99 (严格按新旧顺序)
+// 	if ok := s.fillTablesL98ToL99(cd); ok {
+// 		return true
+// 	}
+// 	// 向下合并受阻（比如底层被锁，或最旧的表不够大），则尝试 L98 层内碎片整理
+// 	return s.fillTablesL98ToL98(cd)
+// }
+
+// // 物理逻辑完全对标 L0 -> Lbase，严格保证按 SST 的新旧程度下沉！
+// func (s *levelsController) fillTablesL98ToL99(cd *compactDef) bool {
+// 	// 确保目标层绝对不能是 0 (我们的目标层是 99)
+// 	if cd.nextLevel.level != 99 {
+// 		panic("Target level for L98 compaction must be 99.")
+// 	}
+
+// 	// 1. 使用 Badger 原生的双层并发锁
+// 	cd.lockLevels()
+// 	defer cd.unlockLevels()
+
+// 	top := cd.thisLevel.tables // 获取 L98 所有的碎片表 (注意：top[0] 绝对是最旧的文件)
+// 	if len(top) == 0 {
+// 		return false
+// 	}
+
+// 	// 2. 守门员机制：如果最旧的文件都还不够大，先不触发下沉，耐心等待它变胖
+// 	targetSize := int64(0.8 * float64(cd.t.fileSz[0])) // 沿用 L0 的 0.8 倍阈值
+// 	if top[0].Size() < targetSize {
+// 		return false
+// 	}
+
+// 	var out []*table.Table
+// 	if len(cd.dropPrefixes) > 0 {
+// 		// 如果是执行 dropPrefix (全库删除)，全量带走
+// 		out = top
+// 	} else {
+// 		var kr keyRange
+// 		// 3. 严格遵循新旧时序：绝对从 top[0] (最旧) 开始圈地！
+// 		for _, t := range top {
+// 			dkr := getKeyRange(t)
+// 			// 注意：如果 kr 为空，overlapsWith 默认返回 true，所以 top[0] 必定被选中
+// 			if kr.overlapsWith(dkr) {
+// 				out = append(out, t) // 累计这个重叠的碎片
+// 				kr.extend(dkr)       // 撑大合并范围
+// 			} else {
+// 				// 💥 核心：一旦遇到范围不重叠的文件，立即停止！
+// 				// 绝对不往后跳跃寻找，严格保证按照时间的顺序，一批一批地往下沉！
+// 				break
+// 			}
+// 		}
+// 	}
+
+// 	// 计算本次圈出的 L98 碎片的整体边界
+// 	cd.thisRange = getKeyRange(out...)
+// 	cd.top = out
+
+// 	// 4. 寻找 L99 (有序层) 的受害者
+// 	// L99 是全局有序的，用二分查找极速切出重叠的底表
+// 	left, right := cd.nextLevel.overlappingTables(levelHandlerRLocked{}, cd.thisRange)
+// 	cd.bot = make([]*table.Table, right-left)
+// 	copy(cd.bot, cd.nextLevel.tables[left:right])
+
+// 	// 5. 确定下一层的锁定范围
+// 	if len(cd.bot) == 0 {
+// 		// 完全无重叠，直接空降 L99
+// 		cd.nextRange = cd.thisRange
+// 	} else {
+// 		// 有重叠，必须以 L99 真实受影响的数据边界为准
+// 		cd.nextRange = getKeyRange(cd.bot...)
+// 	}
+
+// 	// 6. 全局并发仲裁！
+// 	// 因为我们没有在前面做手动避让，所以如果 top[0] 或者 bot 中的任何一个表正在被其他协程合并，
+// 	// compareAndAdd 就会严格返回 false，拦截本次操作。
+// 	// 这完美保证了：既然轮不到最旧的文件下沉，那大家就都等着，绝不越界！
+// 	return s.cstatus.compareAndAdd(thisAndNextLevelRLocked{}, *cd)
+// }
+// func (s *levelsController) fillTablesL98ToL98(cd *compactDef) bool {
+// 	if cd.compactorId != 1 {
+// 		// Only compactor zero can work on this.
+// 		return false
+// 	}
+
+// 	cd.nextLevel = s.hotTier
+// 	cd.nextRange = keyRange{}
+// 	cd.bot = nil
+
+// 	y.AssertTrue(cd.thisLevel.level == 98)
+
+// 	// 同层合并，只需加一次锁防死锁
+// 	s.hotTier.RLock()
+// 	defer s.hotTier.RUnlock()
+
+// 	s.cstatus.Lock()
+// 	defer s.cstatus.Unlock()
+
+// 	top := cd.thisLevel.tables
+// 	var out []*table.Table
+
+// 	targetSize := int64(0.8 * float64(cd.t.fileSz[0]))
+// 	accumulatedSize := int64(0)
+
+// 	if len(top) > 0 && top[0].Size() >= targetSize {
+// 		// 【模式A：高阶避让机制】
+// 		// 尾部 SST 已经满足下沉条件，但进到了 L98ToL98，说明 L98ToL99 失败了 (底层 L99 被锁)。
+// 		// 为了防止写停顿，跳过尾部大文件，去中间寻找连续的小碎片进行合并。
+// 		for i := 0; i < len(top); i++ {
+// 			t := top[i]
+
+// 			// 并发控制：遇到正在被合并的表，或遇到大表，直接避让跳过
+// 			if _, beingCompacted := s.cstatus.tables[t.ID()]; beingCompacted || t.Size() >= targetSize {
+// 				if len(out) > 0 {
+// 					// 致命底线：为了保证时间序列连续，一旦已经开始收集，遇到阻断必须 break！
+// 					break
+// 				}
+// 				continue
+// 			}
+
+// 			out = append(out, t)
+// 			accumulatedSize += t.Size()
+
+// 			if accumulatedSize >= targetSize {
+// 				break
+// 			}
+// 		}
+// 	} else {
+// 		// 【模式B：贪吃蛇打包机制】
+// 		// 尾部 SST 不够大，从尾部开始向前连续吃，直到吃够 0.8
+// 		for i := 0; i < len(top); i++ {
+// 			t := top[i]
+
+// 			// 并发控制
+// 			if _, beingCompacted := s.cstatus.tables[t.ID()]; beingCompacted {
+// 				if len(out) > 0 {
+// 					break // 保证连续性
+// 				}
+// 				continue
+// 			}
+
+// 			out = append(out, t)
+// 			accumulatedSize += t.Size()
+
+// 			if accumulatedSize >= targetSize {
+// 				break
+// 			}
+// 		}
+// 	}
+
+// 	// 碎片整理拦截条件：太少不合，防止浪费 I/O
+// 	if len(out) < 2 {
+// 		return false
+// 	}
+// 	if len(out) < 4 && accumulatedSize < targetSize/2 {
+// 		return false
+// 	}
+
+// 	cd.thisRange = infRange
+// 	cd.top = out
+
+// 	// 注册全局状态锁
+// 	thisLevel := s.cstatus.hotTierStatus
+// 	thisLevel.ranges = append(thisLevel.ranges, infRange)
+// 	for _, t := range out {
+// 		s.cstatus.tables[t.ID()] = struct{}{}
+// 	}
+
+// 	// L98ToL98 合并，将目标文件大小设为最大，保证输出为单一物理文件以减少碎片
+// 	cd.t.fileSz[0] = math.MaxUint32
+// 	return true
+// }
+// zzlHACK:4210 END
 
 // zzlHACK:4803 专用于 99 层的冷数据驱逐器
 // 完美复刻 Badger 原生 Ln -> Ln+1 的单表精准驱逐逻辑，支持极致并发

@@ -118,6 +118,59 @@ func (s *levelHandler) replaceTables(toDel, toAdd []*table.Table) error {
 		toDelMap[t.ID()] = struct{}{}
 	}
 	var newTables []*table.Table //创建一个容纳目标层所有SST的切片
+
+	// zzlHACK:2026042100处理贪吃蛇以及BadgerDB自身L0-L0时导致的文件ID倒挂
+	// inserted := false // 标记新 SST 是否已经完成了占位替换
+	// for _, t := range s.tables {
+	// 	_, found := toDelMap[t.ID()]
+	// 	if !found {
+	// 		// 未受影响的 SST，直接保留
+	// 		newTables = append(newTables, t)
+	// 	} else {
+	// 		// 属于被合并销毁的 SST
+	// 		s.subtractSize(t)
+
+	// 		// 💥 核心修复：时间线原地继承！
+	// 		// 在我们遇到第一个被销毁的 SST 时，就把新合并出来的 SST 塞在这个位置！
+	// 		// 因为 L98 的合并必定是连续的，这就完美保证了新 SST 继承了老 SST 的时间生态位。
+	// 		if !inserted {
+	// 			for _, newT := range toAdd {
+	// 				s.addSize(newT)
+	// 				newT.IncrRef()
+	// 				newTables = append(newTables, newT)
+	// 			}
+	// 			inserted = true
+	// 		}
+	// 	}
+	// }
+	// // 💥 如果是前台 Memtable Flush 刷盘下来的新数据 (toDel 为空，inserted 必定为 false)
+	// // 它们代表着绝对最新的时间线，理所应当追加到数组的最末尾！
+	// if !inserted {
+	// 	for _, newT := range toAdd {
+	// 		s.addSize(newT)
+	// 		newT.IncrRef()
+	// 		newTables = append(newTables, newT)
+	// 	}
+	// }
+	// s.tables = newTables
+
+	// // zzlHACK:注意修改L98的SST顺序！
+	// if s.level == 98 || s.level == 0 {
+	// 	// NOTE:如果是无序的0和98,那么为了避免文件ID倒挂,所以就跳过
+	// 	// 缓冲层必须按 FileID (时间) 排序，保证越新的数据越靠后,即按照ID从小到大排序
+	// 	// sort.Slice(s.tables, func(i, j int) bool {
+	// 	// 	return s.tables[i].ID() < s.tables[j].ID()
+	// 	// })
+	// } else {
+	// 	// 主树和 L99 有序层按 Key 排序
+	// 	sort.Slice(s.tables, func(i, j int) bool {
+	// 		return y.CompareKeys(s.tables[i].Smallest(), s.tables[j].Smallest()) < 0
+	// 	})
+	// }
+	// s.Unlock()             // s.Unlock before we DecrRef tables -- that can be slow.
+	// return decrRefs(toDel) //减少引用，以便于将旧的SST删除掉
+	// zzlHACK:END
+
 	// 下面这个for是先将目标层未受影响的SST加入newTables
 	for _, t := range s.tables { //遍历目标层的原有SST，如果不在目标层受影响数组（cd.bot）内，就直接加到newTables，否则就跳过
 		_, found := toDelMap[t.ID()]
