@@ -612,6 +612,7 @@ func (db *DB) VlogStatsToString() string {
 
 func (db *DB) close() (err error) {
 	db.opt.Infof(db.vlog.StatsToString()) // zzlHACK:4160 输出当前Vlog中数据情况
+	db.zzlHeatmap.Print()                 // zzlHACK:4160 输出热力树的情况
 	defer db.allocPool.Release()
 
 	db.opt.Debugf("Closing database")

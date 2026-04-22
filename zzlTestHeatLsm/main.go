@@ -45,9 +45,9 @@ func main() {
 	// ==========================================
 	fmt.Println("\n>>> [阶段 1] 混沌写入与热点培养中 (制造数十万版本冲突)...")
 
-	const totalOps = 2000000
-	const hotKeyCount = 1500      // 热数据
-	const coldKeyCount = 20000000 // 冷数据，做背景干扰
+	const totalOps = 1000000
+	const hotKeyCount = 750       // 热数据
+	const coldKeyCount = 10000000 // 冷数据，做背景干扰
 
 	// 	const totalOps = 3000000
 	// const hotKeyCount = 1000    // 只有50个热点Key，被疯狂覆写

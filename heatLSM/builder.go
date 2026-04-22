@@ -124,7 +124,7 @@ type HeatmapManager struct {
 
 	// --- 【新增：集中式分块物理内存池 (Chunked Pool)】 ---
 	// 使用二维数组可以完美避免 append 扩容导致的底层内存搬迁问题，并发绝对安全(第一层是指每次分配的StatsChunkSize个Chunk,第二层则是当次分配的具体的各个Chunk)
-	StatsChunks [][]RegionStats // 注意这个是定长内存池,来提高cpu cache的命中率
+	StatsChunks [][]RegionStats // NOTE:注意这个是定长内存池,用于瘦节点以及提高cpu cache的命中率.且因为是逻辑回收,不会触发GO语言的垃圾回收,学名叫做Arena Allocator（竞技场内存分配）??
 	FreeList    []int32         // 垃圾回收站，存放被合并/销毁的 StatsID，用于 O(1) 复用
 	poolLock    sync.Mutex      // 仅在 Allocate 和 Free 时加锁，不影响高频的 AddSample
 
@@ -308,7 +308,8 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
 	n.Lock()
 	defer n.Unlock()
 
-	if !n.IsLeaf {
+	// 💥 防御机制：如果当前节点刚刚被父节点的后台减枝操作回收了，直接丢弃本次采样！
+	if !n.IsLeaf || n.StatsID == -1 {
 		return
 	}
 
@@ -333,6 +334,11 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
 		stats.WSuffixReservoir[r] = k
 	}
 	if stats.WriteCount > uint32(n.SplitThreshold) && len(stats.WSuffixReservoir) >= n.ReservoirCap {
+		if stats.OverwriteRation >= 0.85 {
+			// 如果覆写率已经极高,那么就暂停分裂,且
+			n.SplitThreshold *= 2
+			return
+		}
 		n.Evolve(m) // 传入 manager
 	}
 	return
@@ -416,7 +422,7 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 	if fatherOverwriteRation < 0 {
 		fatherOverwriteRation = 0
 	}
-
+	childBaseThreshold := uint32(1 << (nextLevel + 10))
 	// 遍历选中的区间（每一轮最多可以增加3个子节点【头部间隙节点(仅第一个元素会加)、当前具有公共前缀的区间节点、尾部间隙节点】）
 	for i, oneRange := range PrefixGroups {
 		if i == 0 {
@@ -431,7 +437,14 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 			// 【重构核心】：为新的间隙节点向大内存池申请一块空间
 			frontChildStatsID := m.AllocateStats(childCap)
 			frontChildStats := m.getStats(frontChildStatsID)
-			frontChildStats.WriteCount = uint32(rangeWriteCount * wRangeRation)
+			inheritedWrites := uint32(rangeWriteCount * wRangeRation)
+			// 🛡️ 防分裂雪崩：强制把继承下来的写入量卡在子节点阈值的 50% 以下！
+			// 这样子节点出生后，至少还要再吃满一半的阈值，才会被允许再次分裂。
+			safeMaxWrites := childBaseThreshold / 2
+			if inheritedWrites > safeMaxWrites {
+				inheritedWrites = safeMaxWrites
+			}
+			frontChildStats.WriteCount = inheritedWrites
 			frontChildStats.EpochStartWrite = frontChildStats.WriteCount
 			frontChildStats.WindowStartWrite = frontChildStats.WriteCount
 			if frontChildStats.WriteCount > 0 {
@@ -462,7 +475,14 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 		// 【重构核心】：为当前具有公共前缀的有效区间申请空间
 		childStatsID := m.AllocateStats(childCap)
 		childStats := m.getStats(childStatsID)
-		childStats.WriteCount = uint32(rangeWriteCount * wRangeRation)
+		inheritedWrites := uint32(rangeWriteCount * wRangeRation)
+		// 🛡️ 防分裂雪崩：强制把继承下来的写入量卡在子节点阈值的 50% 以下！
+		// 这样子节点出生后，至少还要再吃满一半的阈值，才会被允许再次分裂。
+		safeMaxWrites := childBaseThreshold / 2
+		if inheritedWrites > safeMaxWrites {
+			inheritedWrites = safeMaxWrites
+		}
+		childStats.WriteCount = inheritedWrites
 		childStats.EpochStartWrite = childStats.WriteCount
 		childStats.WindowStartWrite = childStats.WriteCount
 		if childStats.WriteCount > 0 {
@@ -510,7 +530,14 @@ func (node *HeatNode) splitReservoir(PrefixGroups []ResIndexRange, m *HeatmapMan
 			// 申请尾部间隙空间
 			afterChildStatsID := m.AllocateStats(childCap)
 			afterChildStats := m.getStats(afterChildStatsID)
-			afterChildStats.WriteCount = uint32(rangeWriteCount * wRangeRation)
+			inheritedWrites := uint32(rangeWriteCount * wRangeRation)
+			// 🛡️ 防分裂雪崩：强制把继承下来的写入量卡在子节点阈值的 50% 以下！
+			// 这样子节点出生后，至少还要再吃满一半的阈值，才会被允许再次分裂。
+			safeMaxWrites := childBaseThreshold / 2
+			if inheritedWrites > safeMaxWrites {
+				inheritedWrites = safeMaxWrites
+			}
+			afterChildStats.WriteCount = inheritedWrites
 			afterChildStats.EpochStartWrite = afterChildStats.WriteCount
 			afterChildStats.WindowStartWrite = afterChildStats.WriteCount
 			if afterChildStats.WriteCount > 0 {
@@ -570,28 +597,32 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 		// =========================================================
 		var absStart, absEnd Key
 
-		// 还原绝对起点
+		// 只有当前是叶子节点，且需要参与排位赛时，我们才真正分配内存 (深拷贝)！
+		// 路由节点只需要传递逻辑视图，极大地削减了 90% 的 GC 内存分配！
+		buildKey := func(prefix, suffix Key) Key {
+			res := make(Key, 0, len(prefix)+len(suffix))
+			res = append(res, prefix...)
+			res = append(res, suffix...)
+			return res
+		}
 		if len(node.RangeStart) > 0 {
-			absStart = make(Key, 0, len(currentPrefix)+len(node.RangeStart))
-			absStart = append(absStart, currentPrefix...)
-			absStart = append(absStart, node.RangeStart...)
+			// 如果是叶子，分配真实内存；如果不是，暂存闭包延后分配
+			if isLeaf {
+				absStart = buildKey(currentPrefix, node.RangeStart)
+			}
 		} else {
-			absStart = parentAbsStart // 如果自身起点是空(-∞)，则继承父节点的绝对起点
+			absStart = parentAbsStart
 		}
-
-		// 还原绝对终点
 		if len(node.RangeEnd) > 0 {
-			absEnd = make(Key, 0, len(currentPrefix)+len(node.RangeEnd))
-			absEnd = append(absEnd, currentPrefix...)
-			absEnd = append(absEnd, node.RangeEnd...)
+			if isLeaf {
+				absEnd = buildKey(currentPrefix, node.RangeEnd)
+			}
 		} else {
-			absEnd = parentAbsEnd // 如果自身终点是nil(+∞)，则继承父节点的绝对终点
+			absEnd = parentAbsEnd
 		}
 
-		// 计算要传给子节点的全新前缀
-		nextPrefix := make(Key, 0, len(currentPrefix)+len(node.PathSegment))
-		nextPrefix = append(nextPrefix, currentPrefix...)
-		nextPrefix = append(nextPrefix, node.PathSegment...)
+		// nextPrefix 必须分配，因为要向下传递给所有子节点
+		nextPrefix := buildKey(currentPrefix, node.PathSegment)
 		// =========================================================
 
 		var childrenCopy []*HeatNode
@@ -661,6 +692,67 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 		for _, child := range childrenCopy {
 			// 将算好的绝对边界作为“父边界”传给子节点
 			traverse(child, nextPrefix, absStart, absEnd)
+		}
+		// =========================================================
+		// 💥【新增：后序结构减枝 (Structure Pruning)】💥
+		// 子节点全部衰减完毕，向上回溯时，检查当前路由节点能否“折叠”
+		// =========================================================
+		if !isLeaf {
+			node.Lock() // 重新锁住自己，准备可能的手术
+
+			allChildrenAreLeaves := true
+			var totalRatio float64 = 0.0
+			var totalEpochWrites uint32 = 0
+
+			// 检查所有子节点的状态
+			for _, child := range node.Children {
+				child.RLock()
+				if !child.IsLeaf {
+					allChildrenAreLeaves = false
+					child.RUnlock()
+					break // 只要有一个子节点还是路由节点，当前节点就不能折叠
+				}
+				if child.StatsID != -1 {
+					childStats := m.getStats(child.StatsID)
+					// 累加子节点的覆写率和本周期的绝对写入量
+					totalRatio += childStats.OverwriteRation
+					totalEpochWrites += (childStats.WriteCount - childStats.EpochStartWrite)
+				}
+				child.RUnlock()
+			}
+
+			// 🔪 触发减枝的条件：
+			// 1. 所有子节点都已经是叶子了（一层一层从底向上折叠，防止暴力塌缩）
+			// 2. 子节点的总体覆写率极低（比如加起来都不到 0.1）
+			// 3. 绝对写入量也极低（确实没人写了，彻底冷透）
+			if allChildrenAreLeaves && totalRatio < 0.1 && totalEpochWrites < 100 {
+
+				// 1. 清理门户：把所有子节点占用的物理内存槽位全部释放，送入回收站！
+				for _, child := range node.Children {
+					child.Lock() // 锁住子节点，防止与并发的 AddSample 冲突！
+					if child.StatsID != -1 {
+						m.FreeStats(child.StatsID)
+						child.StatsID = -1
+					}
+					child.Unlock()
+				}
+
+				// 2. 结构塌缩：丢弃所有孩子和分割键，降级为叶子节点
+				node.IsLeaf = true
+				node.Children = nil
+				node.SplitRangeKey = nil
+
+				// 3. 灵魂重铸：既然变成了叶子，就要为它分配一个新的统计内存池
+				node.StatsID = m.AllocateStats(node.ReservoirCap)
+				newStats := m.getStats(node.StatsID)
+
+				// 继承一点残余的热度（取平均值或直接归零都可以，这里安全起见赋 0）
+				newStats.OverwriteRation = 0.0
+
+				// 可选：打个日志看看减枝效果
+				// fmt.Printf("🔪 [减枝触发] 塌缩节点 Lv%d, 前缀: %s, 释放了 %d 个空洞\n", node.Level, string(node.PathSegment), len(childrenCopy))
+			}
+			node.Unlock()
 		}
 	}
 
@@ -835,8 +927,10 @@ func (n *HeatNode) CalculateTreeMemory() int64 {
 		return 0
 	}
 
-	// 1. 结构体本身的基础大小 (64位机器下，指针、int64、切片头等加起来瘦身后大概 120 字节)
-	var size int64 = 120
+	// 1. 结构体本身的基础大小
+	// (64位机器下，Slice头24字节, int64/指针8字节, RWMutex24字节。
+	// 新增了 SplitEpoch 后，通过内存对齐，单节点基础大小约为 192 字节)
+	var size int64 = 192
 
 	// 2. 累加 PathSegment 和边界 Key 的底层真实字节大小
 	size += int64(len(n.PathSegment))
@@ -873,8 +967,9 @@ func (m *HeatmapManager) CalculatePoolMemory() int64 {
 	// 2. 遍历每一个 Chunk 计算内存
 	for _, chunk := range m.StatsChunks {
 		// 🚀 瘦身后的 RegionStats 结构体预估：
-		// IsActive(8字节对齐) + WriteCount(8) + OverwriteRatio(8) + EpochStartWrite(8)
-		// + CurrentHLL指针(8) + WSuffixReservoir切片头(24) = 64 字节！(比原来省了近一半)
+		// IsActive(1) + 填充(3) + WriteCount(4) + WindowStartWrite(4) + EpochStartWrite(4)
+		// + OverwriteRatio(8) + CurrentHLL指针(8) + WSuffixReservoir切片头(24) = 56 字节。
+		// Go 底层按 8 字节对齐，完美占据 64 字节 (刚好一条 CPU Cache Line)！
 		size += int64(cap(chunk) * 64)
 
 		// 3. 深入当前 Chunk 的每一个槽位，计算动态蓄水池的开销
