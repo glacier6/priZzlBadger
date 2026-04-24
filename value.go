@@ -1635,7 +1635,22 @@ func (vlog *valueLog) StatsToString() string {
 
 	for _, fid := range fids {
 		lf := vlog.filesMap[fid]
+
+		// 默认读取文件大小 (对于已经封存的文件，这就是真实大小)
 		size := lf.size.Load()
+		activeMarker := "   "
+		// 🛠️ 拦截活跃文件，读取其【真实的写入水位线】
+		if fid == vlog.maxFid {
+			activeMarker = "(*)"
+			// 读取冷区活跃文件的真实写入偏移量
+			size = vlog.writableLogOffset.Load()
+		} else if fid == vlog.hotMaxFid {
+			activeMarker = "(*)"
+			// NOTE: 这里请替换成你为热区大巴添加的 offset 追踪变量！
+			// 如果你加了 hotMaxFid，那你大概率也加了一个类似 hotWritableLogOffset 的变量
+			size = vlog.hotWritableLogOffset.Load()
+		}
+
 		discard := discardMap[fid]
 
 		ratio := float64(0)
@@ -1652,11 +1667,6 @@ func (vlog *valueLog) StatsToString() string {
 			hotCount++
 		} else {
 			coldCount++
-		}
-
-		activeMarker := "   "
-		if fid == vlog.maxFid || fid == vlog.hotMaxFid {
-			activeMarker = "(*)" // 标记当前正在接受写入的大巴
 		}
 
 		b.WriteString(fmt.Sprintf("%s %s FID: %-10d | Size: %7.2f MB | Discard(垃圾): %7.2f MB | Garbage Ratio: %5.2f%%\n",

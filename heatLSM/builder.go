@@ -335,8 +335,9 @@ func (n *HeatNode) AddSample(keySuffix Key, isRead bool, m *HeatmapManager) {
 	}
 	if stats.WriteCount > uint32(n.SplitThreshold) && len(stats.WSuffixReservoir) >= n.ReservoirCap {
 		if stats.OverwriteRation >= 0.85 {
-			// 如果覆写率已经极高,那么就暂停分裂,且
+			// 如果覆写率已经极高,那么就暂停分裂
 			n.SplitThreshold *= 2
+			// fmt.Printf("覆写率已经极高,暂停分裂,当前写入量为%d,覆写率为%.4f,分裂阈值提高到%d", stats.WriteCount, stats.OverwriteRation, n.SplitThreshold)
 			return
 		}
 		n.Evolve(m) // 传入 manager
@@ -1070,7 +1071,7 @@ func (m *HeatmapManager) Print() {
 	fmt.Println("\n================ 🌳 heatLSM 热力树拓扑与覆写率全景图 🌳 ================")
 	if m.MotherTree != nil && m.MotherTree.Root != nil {
 		// 从根节点开始递归打印，初始前缀为空，且根节点作为其所在层级的“最后一个节点”
-		PrintTree(m.MotherTree.Root, "", true, m)
+		// PrintTree(m.MotherTree.Root, "", true, m)
 	}
 	fmt.Println("========================================================================")
 

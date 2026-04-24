@@ -570,7 +570,7 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 				level: 99,
 				t:     targets,
 			}
-			s.kv.opt.Infof("HotTier L99 is full (%d MB), triggering eviction to L%d\n",
+			fmt.Printf("HotTier L99 is full (%d MB), triggering eviction to L%d\n",
 				size/(1<<20), targets.baseLevel)
 			run(p)
 		}
@@ -622,12 +622,14 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 		// Can add a done channel or other stuff.
 		case <-ticker.C: //每50ms执行一次合并 ，上面那几个闭包函数合并时在时间上一般的执行顺序（需要看的顺序）为runOnce（），moveL0toFront（），run（），tryLmaxToLmaxCompaction（）
 			count++
+			hotCount++
 			// Each ticker is 50ms so 50*200=10seconds.
 			if s.kv.opt.LmaxCompaction && id == 2 && count >= 200 { // 注意只有2号协程才会执行底层自我合并的操作，且每10秒才会执行一次这个操作（LmaxCompaction参数控制这个功能是否开启）
 				tryLmaxToLmaxCompaction() //执行最底层自我合并
 				count = 0
-			} else if id == 3 && hotCount >= 100 { // zzlHACK:4803 多一个else if，让3号协程专门处理99层冷数据下放，所有协程都可以处理98-99层的碎片整理
+			} else if id == 3 && hotCount >= 200 { // zzlHACK:4803 多一个else if，让3号协程专门处理99层冷数据下放，所有协程都可以处理98-99层的碎片整理
 				tryHotTierOrdEviction()
+				// NOTE:驱逐这样写就是为了避免系统繁忙时抢占系统资源,这样就可以在系统空闲时再来处理降热范围的数据下沉
 				hotCount = 0
 			} else {
 				runOnce() //其余的进行普通的压缩
@@ -911,7 +913,7 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 		s.hotTier.RUnlock()
 
 		// 触发阈值：当 L98 的碎文件达到一定数量 (比如 10 个)
-		if l98Count >= 5 { // zzlTODO:看看有没有必要拉大,就是当1号协程管理不过来了,拉过来一个帮忙的来处理L98-L99(注意L98-L98只能由1号协程来做)
+		if l98Count >= 7 { // zzlTODO:看看有没有必要拉大,就是当1号协程管理不过来了,拉过来一个帮忙的来处理L98-L99(注意L98-L98只能由1号协程来做)
 			prios = append(prios, compactionPriority{
 				level:    98,
 				score:    2.0,   // 给个及格分数即可
@@ -1276,7 +1278,12 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		if cd.nextLevel.level == 98 || cd.nextLevel.level == 99 {
 			// L98 和 L99 是热点层，文件大小我们直接复用 L1 层的基准大小即可
 			// NOTE:L99和L98文件大小和L0保持一致.
-			bopts.TableSize = uint64(cd.t.fileSz[0]) // 这里设置的值会在下面的NewTableBuilder函数内乘以0.95转为tableCapacity并且应用在builder.ReachedCapacity()函数内
+			// zzlTODO:修改L99层文件大小
+			targetSize := uint64(cd.t.fileSz[5])
+			if targetSize > (64 << 20) {
+				targetSize = 64 << 20
+			}
+			bopts.TableSize = targetSize // 这里设置的值会在下面的NewTableBuilder函数内乘以0.95转为tableCapacity并且应用在builder.ReachedCapacity()函数内
 
 			// bopts.BloomFalsePositive = 0.001
 			// bopts.Compression = options.Snappy
