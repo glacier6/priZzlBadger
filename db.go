@@ -81,6 +81,20 @@ import (
 
 // zzlHACK:END
 
+// zzlHACK:4806 统计各层合并了多少
+// 定义一个全局字典，用来记录不同合并路径的物理写入字节数
+// Key 是路径描述，比如 "0->5", "98->99"
+// Value 是累加的物理写入 Bytes
+// var CompactionTraffic sync.Map
+
+// // 提供一个辅助函数来原子累加
+// func AddCompactionTraffic(path string, bytesWritten uint64) {
+// 	v, _ := CompactionTraffic.LoadOrStore(path, new(atomic.Uint64))
+// 	v.(*atomic.Uint64).Add(bytesWritten)
+// }
+
+// zzlHACK:END
+
 var (
 	badgerPrefix = []byte("!badger!")       // Prefix for internal keys used by badger.
 	txnKey       = []byte("!badger!txn")    // For indicating end of entries in txn.
@@ -610,9 +624,37 @@ func (db *DB) VlogStatsToString() string {
 
 // zzlHACK:END
 
+// zzlHACK:4806
+// func PrintCompactionBreakdown() {
+// 	fmt.Println("\n================ 📈 物理写入量 (写放大) 层级拆解 📈 ================")
+
+// 	// 计算一下这批合并流量的总和
+// 	var totalCompactionBytes uint64 = 0
+
+// 	// 遍历我们在 Badger 源码里埋点记录的 Map
+// 	CompactionTraffic.Range(func(key, value interface{}) bool {
+// 		path := key.(string)
+// 		bytesWritten := value.(*atomic.Uint64).Load()
+
+// 		totalCompactionBytes += bytesWritten
+
+// 		// 格式化输出，比如转成 MB 或 GB
+// 		mb := float64(bytesWritten) / (1024 * 1024)
+// 		fmt.Printf("  🔹 路径 [%-12s] : %10.2f MB\n", path, mb)
+// 		return true
+// 	})
+
+// 	fmt.Println("----------------------------------------------------------------")
+// 	fmt.Printf("  🔺 后台合并总物理写入量: %.2f MB\n", float64(totalCompactionBytes)/(1024*1024))
+// 	fmt.Println("====================================================================\n")
+// }
+
+// zzlHACK:END
+
 func (db *DB) close() (err error) {
 	db.opt.Infof(db.vlog.StatsToString()) // zzlHACK:4160 输出当前Vlog中数据情况
 	db.zzlHeatmap.Print()                 // zzlHACK:4160 输出热力树的情况
+	// PrintCompactionBreakdown()            // zzlHACK:4806 输出热力树的情况
 	defer db.allocPool.Release()
 
 	db.opt.Debugf("Closing database")

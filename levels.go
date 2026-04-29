@@ -913,14 +913,14 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 		s.hotTier.RUnlock()
 
 		// 触发阈值：当 L98 的碎文件达到一定数量 (比如 10 个)
-		if l98Count >= 7 { // zzlTODO:看看有没有必要拉大,就是当1号协程管理不过来了,拉过来一个帮忙的来处理L98-L99(注意L98-L98只能由1号协程来做)
-			prios = append(prios, compactionPriority{
-				level:    98,
-				score:    2.0,   // 给个及格分数即可
-				adjusted: 999.0, // 霸道特权：赋予极高的调整分数，确保它在接下来的排序中稳居全局第一！
-				t:        t,     // 携带当前的 target 统计信息
-			})
-		}
+		// if l98Count >= 5 { // zzlTODO:看看有没有必要拉大,就是当1号协程管理不过来了,拉过来一个帮忙的来处理L98-L99(注意L98-L98只能由1号协程来做)
+		prios = append(prios, compactionPriority{
+			level:    98,
+			score:    2.0, // 给个及格分数即可
+			adjusted: float64(l98Count) / 10.0,
+			t:        t, // 携带当前的 target 统计信息
+		})
+		// }
 	}
 	// zzlHACK:END
 
@@ -2466,6 +2466,17 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	if err := thisLevel.deleteTables(cd.top); err != nil { //把当前层老的tables删除掉
 		return err
 	}
+	// zzlHACK:4806 统计各层合并了多少
+	// var pathName string
+	// if cd.thisLevel.level == cd.nextLevel.level {
+	// 	pathName = fmt.Sprintf("L%d->L%d (Intra)", cd.thisLevel.level, cd.nextLevel.level)
+	// } else {
+	// 	pathName = fmt.Sprintf("L%d->L%d", cd.thisLevel.level, cd.nextLevel.level)
+	// }
+
+	// // sizeNewTables 绝对不可能是负数，强转 uint64 是安全的
+	// AddCompactionTraffic(pathName, uint64(sizeNewTables))
+	// zzlHACK:END
 
 	// Note: For level 0, while doCompact is running, it is possible that new tables are added.
 	// However, the tables are added only to the end, so it is ok to just delete the first table.

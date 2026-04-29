@@ -41,7 +41,7 @@ const (
 
 	// 高低覆写率的分界线
 	// NOTE:写成排名制的，然后最好还要关联每个节点具体的写入量！因为最终这个参数要控制的是进热层的数据量！
-	HotVolumePercentage = 0.20 // 1. 常规配额：取当期全局总Key量的前 20%
+	HotVolumePercentage = 0.15 // 1. 常规配额：取当期全局总Key量的前 20%
 	MinHotRatioFloor    = 0.30 // 2. 入场底线：覆写率低于 0.3 的，哪怕配额没满也绝对不要
 	HighHeatBypassRatio = 0.50 // 3. VVIP特权：覆写率 >= 0.5 的，哪怕配额满了也强行加座！
 
@@ -608,16 +608,12 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 		}
 		if len(node.RangeStart) > 0 {
 			// 如果是叶子，分配真实内存；如果不是，暂存闭包延后分配
-			if isLeaf {
-				absStart = buildKey(currentPrefix, node.RangeStart)
-			}
+			absStart = buildKey(currentPrefix, node.RangeStart)
 		} else {
 			absStart = parentAbsStart
 		}
 		if len(node.RangeEnd) > 0 {
-			if isLeaf {
-				absEnd = buildKey(currentPrefix, node.RangeEnd)
-			}
+			absEnd = buildKey(currentPrefix, node.RangeEnd)
 		} else {
 			absEnd = parentAbsEnd
 		}
@@ -793,6 +789,30 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 	sort.Slice(newZones, func(i, j int) bool {
 		return bytes.Compare(newZones[i].Start, newZones[j].Start) < 0
 	})
+
+	// =========================================================
+	// 💥 【新增核心逻辑：相邻热点区间合并 (Interval Merging)】 💥
+	// =========================================================
+	var mergedZones []HotZone
+	if len(newZones) > 0 {
+		// 第一个区间直接放入
+		mergedZones = append(mergedZones, newZones[0])
+
+		for i := 1; i < len(newZones); i++ {
+			current := newZones[i]
+			lastMerged := &mergedZones[len(mergedZones)-1]
+
+			// 检查：如果前一个区间的 End 等于当前区间的 Start，说明它们首尾相连！
+			// (注意处理正无穷的情况：如果 lastMerged.End 为 nil 或空，代表正无穷，自然包含后续所有)
+			if len(lastMerged.End) > 0 && bytes.Compare(lastMerged.End, current.Start) == 0 {
+				// 发生融合！将前一个区间的 End 延伸为当前区间的 End
+				lastMerged.End = current.End
+			} else {
+				// 没有相连，作为一个新的独立区间加入
+				mergedZones = append(mergedZones, current)
+			}
+		}
+	}
 
 	// RCU 原子替换
 	m.hotZonesSnapshot.Store(newZones)
@@ -1072,6 +1092,35 @@ func (m *HeatmapManager) Print() {
 	if m.MotherTree != nil && m.MotherTree.Root != nil {
 		// 从根节点开始递归打印，初始前缀为空，且根节点作为其所在层级的“最后一个节点”
 		// PrintTree(m.MotherTree.Root, "", true, m)
+	}
+	snapshot := m.hotZonesSnapshot.Load()
+	if snapshot != nil {
+		zones := snapshot.([]HotZone)
+		if len(zones) == 0 {
+			fmt.Println("⚠️ 当前快照层 (L98/L99 拦截名单) 为空。没有识别到符合标准的热区。")
+		} else {
+			fmt.Printf("🔥 当前共有 %d 个连续的极热区间被 L98/L99 特区拦截保护：\n", len(zones))
+			fmt.Println("----------------------------------------------------------------")
+
+			// 遍历并打印所有被拦截的热区范围
+			for i, zone := range zones {
+				startStr := string(zone.Start)
+				if len(zone.Start) == 0 {
+					startStr = "0" // 优雅显示负无穷
+				}
+
+				endStr := string(zone.End)
+				if len(zone.End) == 0 {
+					endStr = "+∞" // 优雅显示正无穷
+				}
+
+				// 打印格式：[序号] Range: [Start, End)
+				fmt.Printf("  [%03d] 拦截范围: [%s, %s)\n", i+1, startStr, endStr)
+			}
+			fmt.Println("----------------------------------------------------------------")
+		}
+	} else {
+		fmt.Println("⚠️ 快照尚未初始化。")
 	}
 	fmt.Println("========================================================================")
 

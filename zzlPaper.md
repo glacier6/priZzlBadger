@@ -7,13 +7,10 @@ NOTE:NOTE:注意在replaceTables(toDel, toAdd []*table.Table)这里也会触发,
 2.Flush引流 在 zzlHACK:4801
 3.查询流程修改 在 zzlHACK:4802
 4.compaction维护 zzlHACK:4803
-5.compaction跟踪 zzlHACK:4804
+5.compaction跟踪 zzlHACK:4804 zzlHACK:4806(统计各层间合并导致的写入量，注意不包括Flush的)
 6.有关GC的实现 zzlHACK:4160
 7.分类压缩和布隆 NOTE:2026041701 注意分类压缩还有分类布隆都是在这里做，但是分类压缩不要做了，没必要，主要是BadgerDB自身就是比较快的Snappy算法了，虽然分类压缩启用后,降低了约20%空间占用,但是速度下降到和原版一致了(在写放大差4倍的情况下!!!)，分类布隆效果一般,暂时先不启用了!
 8.L98层也开启自我合并的代码 zzlHACK:4210 目前因为性能略微降低,先关闭,需要的话再逐个打开对应位置的注释代码即可.
-
-TODO:现在的性能下降是在高缓存命中率下的结果，有必要测测看纯随机热点的情况
-TODO:停止高覆写率的节点的向下分裂，看看如何减枝
 
 NOTE:HotBuilder不能写成全局的，因为HotBuilder内暂存了KV的话，那上层对应的那几个SST你要怎么办呢，也不能立马删掉，删掉的话如果断电就会导致数据的不一致存在，如果要解决这个问题，又会特别麻烦，所以还是生成碎文件，然后跑协程合并吧
 
@@ -25,6 +22,18 @@ NOTE:写放大？写放大如果下层涉及特别散的话全部都重写？需
 
 NOTE:BadgerDB的版本倒挂，因为GC以及允许多版本的存在，所以同一个key的高版本可能在树的更底层！根本是因为GC回收重写时，查询查的是VLOG中那个带时间戳的key，而不是单key的最新版本！！
 NOTE:NOTE:也正因为如此，BadgerDB的get需要遍历出某个KEY的所有版本才能返回！！！！
+
+NOTE:NOTE:原版BadgerDB会因为YCSB的负载（threadcount）的上升而导致更大的写放大，这主要是因为下面这段代码找baselevel，当系统高负载的时候，因为压缩不过来，会导致一些层级提前达到了BaseLevelSize（虽然按L6层数据量大小，此时这里不该是base层），进而使得层级变高，进而导致写放大提升？
+  dbSize := s.lastLevel().getTotalSize()   //获取L6的实际大小
+	for i := len(s.levels) - 1; i > 0; i-- { //从L6倒序的遍历每一层，得到每一层在当前数据规模的目标上限
+		ltarget := adjust(dbSize) //得到层基础大小（BaseLevelSize 初始为10485760 即 10 << 20） 与  按现在数据规模当前层size的应分配大小（最底层就是实际大小） 的较大值，来作为当前层的目标上限
+		t.targetSz[i] = ltarget
+		if t.baseLevel == 0 && ltarget <= s.kv.opt.BaseLevelSize { //这个就是层号倒序不断地去试，得到首个目标上限比预设的层基础大小（BaseLevelSize）小或等的作为基线层（注意，在这个for循环内并没有考虑各层的当前大小，所以可以想象成就固定是那个倒立漏斗的拐角处，在本函数的下面还会再进行两次下沉）
+			t.baseLevel = i
+		}
+		dbSize /= int64(s.kv.opt.LevelSizeMultiplier) // NOTE:得到下一层目标大小，每次折损10倍（badger默认层间比例为10）
+	}
+
 
 ### 一些系统常识
   - 1.缺页中断
@@ -39,7 +48,6 @@ NOTE:NOTE:也正因为如此，BadgerDB的get需要遍历出某个KEY的所有�
   - 1.KV分离（分界值默认是1MB）
   - 2.KV分离导致的GC
   - 3.从BadgerDB和DGraph的联合结构上入手
-  - 4.NOTE:NOTE:特别注意，点查时，BadgerDB是从高层到底层一层一层找满足的KV对，一旦找到就直接返回！！所以不能写入旧版本时间戳的KV对！
 
 ### 可以调整的参数
   - 1.层级个数
