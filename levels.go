@@ -917,7 +917,7 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 		prios = append(prios, compactionPriority{
 			level:    98,
 			score:    2.0, // 给个及格分数即可
-			adjusted: float64(l98Count) / 10.0,
+			adjusted: float64(l98Count) / 8.0,
 			t:        t, // 携带当前的 target 统计信息
 		})
 		// }
@@ -2474,7 +2474,7 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	// 	pathName = fmt.Sprintf("L%d->L%d", cd.thisLevel.level, cd.nextLevel.level)
 	// }
 
-	// // sizeNewTables 绝对不可能是负数，强转 uint64 是安全的
+	// sizeNewTables 绝对不可能是负数，强转 uint64 是安全的
 	// AddCompactionTraffic(pathName, uint64(sizeNewTables))
 	// zzlHACK:END
 

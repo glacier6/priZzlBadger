@@ -7,6 +7,7 @@ package heatLSM
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,14 @@ import (
 )
 
 const (
+	// BaseSplitThreshold 是 Level 0/1 的基础阈值参考量
+	BaseSplitThreshold = 2048
+	// 💥 LevelGrowthRate 就是你要的“层级翻倍参数”
+	// 设为 2，就是你原版的翻倍逻辑 (2048, 4096, 8192...)
+	// 设为 1，就是所有层级固定阈值 (1024, 1024, 1024...)
+	// 你可以随便调！
+	LevelGrowthRate = 1.5
+
 	// NOTE:蓄水池容量：叶子节点最多存多少个样本触发分裂检查，从4096倒着来/2或许不错，会在第四层达到最小值256
 	MinReservoirCap = 256
 	MaxReservoirCap = 1024
@@ -41,7 +50,7 @@ const (
 
 	// 高低覆写率的分界线
 	// NOTE:写成排名制的，然后最好还要关联每个节点具体的写入量！因为最终这个参数要控制的是进热层的数据量！
-	HotVolumePercentage = 0.15 // 1. 常规配额：取当期全局总Key量的前 20%
+	HotVolumePercentage = 0.20 // 1. 常规配额：取当期全局总Key量的前 20%，准入的越多，则写放大约小，读放大越大，需要找一个均衡的值
 	MinHotRatioFloor    = 0.30 // 2. 入场底线：覆写率低于 0.3 的，哪怕配额没满也绝对不要
 	HighHeatBypassRatio = 0.50 // 3. VVIP特权：覆写率 >= 0.5 的，哪怕配额满了也强行加座！
 
@@ -49,6 +58,7 @@ const (
 	// NOTE:因为HLL依赖大数定律，所以要和热范围视图的更新频率区分开来，最好是与当前节点所处层级的那个分裂阈值SplitThreshold挂钩，比如只有HLL累积了SplitThreshold/4才代表本次采集结果具备有效性，允许更新！
 	// 但是随着每次纪元的结束,依旧会进行一次覆写率和高覆写快照的更新,只是不会重置HLL和EpochStartWrite.此外,需要注意的是,为了保证统计的有效性,当本轮HLL的write数小于1024时,跳过,避免冷启动污染
 	flushThreshold = 1
+	// AsyncSampleRate = 20 // 注释掉就代表全采集
 	// 目前不知道为啥,10000000条数据与操作时,为1和普通版本速度基本一致(频繁触发写入Hot),为4慢6%左右(触发写入Hot),为100慢3%左右(完全不触发写入Hot)
 
 )
@@ -214,18 +224,17 @@ func newHeatNode(Level int64, start, end Key, pathSeg Key, statsID int32) *HeatN
 	if cap < MinReservoirCap {
 		cap = MinReservoirCap
 	}
+	multiplier := math.Pow(LevelGrowthRate, float64(Level))
+	threshold := int64(float64(BaseSplitThreshold) * multiplier)
 	n := &HeatNode{
 		Level:          Level,
-		SplitThreshold: 1 << (Level + 10), // NOTE:目前第一层2048,第二层2048，第三层4096，后续继续*2
+		SplitThreshold: threshold, // NOTE:目前第一层2048，后续每层*LevelGrowthRate
 		ReservoirCap:   cap,
 		RangeStart:     start,
 		RangeEnd:       end,
 		PathSegment:    pathSeg,
 		IsLeaf:         true,
 		StatsID:        statsID, // 绑定灵魂！
-	}
-	if Level == 0 {
-		n.SplitThreshold = 1 << 11
 	}
 	return n
 }
@@ -261,6 +270,9 @@ func NewHeatmapManager() *HeatmapManager {
 func (m *HeatmapManager) RecordWriteAsync(key Key) {
 	// 拷贝一份 Key，防止底层引擎复用 slice 导致后台消费时数据错乱！
 	// (Badger 的 Key 生命周期极短，这步 copy 必不可少)
+	// if fastrand.Uint32n(100) >= AsyncSampleRate { // 采样
+	// 	return
+	// }
 	kCopy := make(Key, len(key))
 	copy(kCopy, key)
 
@@ -648,7 +660,8 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 				// NOTE:置信度闸门 (Confidence Gate)
 				// 只有当新窗口积累了足够的底线样本（MinReservoirCap），算出的暂态覆写率才有意义。
 				// 如果样本太少，直接跳过 EWMA 计算，完美信任它的历史分数，绝不让冷启动引发暴跌！
-				if windowWrites >= uint32(MinReservoirCap) {
+				minConfidence := uint32(float64(node.SplitThreshold) * 0.1)
+				if windowWrites >= minConfidence {
 					currentRatio := 1.0 - (currentUniqueKeys / float64(windowWrites))
 					stats.OverwriteRation = currentRatio*CurrentEpochWeight + stats.OverwriteRation*(1.0-CurrentEpochWeight)
 
@@ -667,6 +680,7 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 				// 💥 幽灵体积回收机制 (Ghost GC)
 				// 既然彻底没人写了，如果它的分数已经跌到完全不可能进热区了（比如跌破 0.05），
 				// 强制清空它的 HLL！防止它这辈子永远用旧数据污染 globalEpochVolume！
+				// TODO:下面这个现在可能会让一些写入量很小，但是是高覆盖的成长不起来，但是暂时先不管吧，不影响YCSB的测试结果
 				if stats.OverwriteRation < 0.05 {
 					stats.OverwriteRation = 0
 					stats.WindowStartWrite = stats.WriteCount
@@ -815,7 +829,7 @@ func (m *HeatmapManager) EpochDecayAndSnapshot() {
 	}
 
 	// RCU 原子替换
-	m.hotZonesSnapshot.Store(newZones)
+	m.hotZonesSnapshot.Store(mergedZones)
 }
 
 // OnMemtableFlush 是负载驱动的入口
@@ -1092,6 +1106,42 @@ func (m *HeatmapManager) Print() {
 	if m.MotherTree != nil && m.MotherTree.Root != nil {
 		// 从根节点开始递归打印，初始前缀为空，且根节点作为其所在层级的“最后一个节点”
 		// PrintTree(m.MotherTree.Root, "", true, m)
+		// =========================================================
+		// 💥 新增：递归计算树的最大深度 💥
+		// =========================================================
+		var maxDepth int64 = 0
+		var findMaxDepth func(node *HeatNode)
+		findMaxDepth = func(node *HeatNode) {
+			if node == nil {
+				return
+			}
+			// 加读锁保护并发访问
+			node.RLock()
+			if node.Level > maxDepth {
+				maxDepth = node.Level
+			}
+			var childrenCopy []*HeatNode
+			if !node.IsLeaf {
+				childrenCopy = make([]*HeatNode, len(node.Children))
+				copy(childrenCopy, node.Children)
+			}
+			node.RUnlock()
+
+			// 递归遍历所有孩子
+			for _, child := range childrenCopy {
+				findMaxDepth(child)
+			}
+		}
+
+		if m.MotherTree != nil && m.MotherTree.Root != nil {
+			findMaxDepth(m.MotherTree.Root)
+			// 从根节点开始递归打印，初始前缀为空，且根节点作为其所在层级的“最后一个节点”
+			// PrintTree(m.MotherTree.Root, "", true, m)
+		}
+
+		// 打印出来的深度如果超过了你设置的 MaxTreeLevel，就说明刹车坏了！
+		fmt.Printf("🌲 [动态树结构监控] 当前母树最大深度 (Max Depth): Lv%d\n", maxDepth)
+
 	}
 	snapshot := m.hotZonesSnapshot.Load()
 	if snapshot != nil {

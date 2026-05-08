@@ -2,6 +2,8 @@
 现在的那个热力图总共分为四个步骤实现
 NOTE:NOTE:注意现在依旧可能kv文件ID倒挂的情况,但是,在热点偏移的时候会触发,其余地方如L0的贪吃蛇什么的已经做了处理了,先暂时不考虑这个问题吧.
 NOTE:NOTE:注意在replaceTables(toDel, toAdd []*table.Table)这里也会触发,原版BadgerDB就会在这里触发(因为L0-L0的操作),所以在zzlHACK:2026042100处理了一下,但是没有启用,因为启用了会导致写入速度下降百分之10,目前不知道为什么,但这个也不属于我的问题,属于BadgerDB自身的问题,本来也不需要处理.
+NOTE:NOTE:我现在这个策略还有一个亮点就是会为系统挡下大量覆写的数据，进而在一定程度上避免写停顿的发生
+
 
 1.构造出 hotTier *levelHandler  在 zzlHACK:4800 修改处
 2.Flush引流 在 zzlHACK:4801
@@ -33,6 +35,17 @@ NOTE:NOTE:原版BadgerDB会因为YCSB的负载（threadcount）的上升而导�
 		}
 		dbSize /= int64(s.kv.opt.LevelSizeMultiplier) // NOTE:得到下一层目标大小，每次折损10倍（badger默认层间比例为10）
 	}
+
+NOTE:看看现在的分流到底有多少去了L0有多少去了L98
+
+zzlNOTE:测试L98的SST动态量级到多少最合适？10 or 8 or 5？  8吧，实际5的读放大小一点，但是写放大变大了很多，就8吧
+zzlNOTE:测试L98的HotVolumePercentage放入多少合适？10 or 15？ 就按照15吧
+zzlTODO:测试不同线程数下的，1000w，1kb的量级以及测试2000w，1kb的量级，1000w，2kb的量级
+zzlTODO:为什么load阶段的最大深度是1阿？
+zzlTODO:当热点转移的时候，L99层旧的可能会被频繁覆写哦，那么此时你要怎么做呢？
+zzlTODO:为什么load阶段只到达了1层的最大深度？
+zzlTODO:对于最后树畸形的，要让sleep一段时间，得出最终稳定态的写放大！
+zzlNOTE:测试20%采集量 + 5倍刷新触发   insert貌似和全采集区别不大，说明性能下降和这个关系不大，哪怕是0采样都区别不大。。。
 
 
 ### 一些系统常识
