@@ -1263,18 +1263,19 @@ func arenaSize(opt Options) int64 {
 
 // 💥 zzlHACK:4801 将原版 buildL0Table 改造为双路构建器
 // buildFlushTables 从 memtable 构建冷热两个新表。
+
 func buildFlushTables(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options, db *DB) (*table.Builder, *table.Builder) {
 	defer iter.Close()
 
 	// 准备两辆大巴车，NOTE:2026041701 注意分类压缩还有分类布隆都是在这里做
-	// coldBopts := bopts
-	// coldBopts.BloomFalsePositive = 0.01
-	// coldBopts.Compression = options.ZSTD
-	// hotBopts := bopts
-	// hotBopts.BloomFalsePositive = 0.001
-	// hotBopts.Compression = options.Snappy
-	coldBuilder := table.NewTableBuilder(bopts)
-	hotBuilder := table.NewTableBuilder(bopts)
+	coldBopts := bopts
+	coldBopts.BloomFalsePositive = 0.01
+	// coldBopts.Compression = options.Snappy
+	hotBopts := bopts
+	hotBopts.BloomFalsePositive = 0.001
+	// hotBopts.Compression = options.None
+	coldBuilder := table.NewTableBuilder(coldBopts)
+	hotBuilder := table.NewTableBuilder(hotBopts)
 
 	for iter.Rewind(); iter.Valid(); iter.Next() {
 		if len(dropPrefixes) > 0 && hasAnyPrefixes(iter.Key(), dropPrefixes) {
@@ -1291,10 +1292,18 @@ func buildFlushTables(iter y.Iterator, dropPrefixes [][]byte, bopts table.Option
 
 		// 💥 命运的分流点！
 		// 注意：这里的 heatmapSnapshot 是你在调用前获取的定格快照，保证全过程一致性
-		if db.zzlHeatmap.IsHotKey(pureKey) {
-			hotBuilder.Add(iter.Key(), iter.Value(), vp.Len) // 热数据上 L98 大巴
+		// 使用原生的 isDeletedOrExpired 函数判断当前 Entry 是否为删除墓碑或已过期数据
+		if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
+			// 🚀 墓碑双写：无视当前的动态热度，同时送入冷热两个大巴车
+			// 这确保了墓碑在 L0 和 L98 两个物理分支上作为“追踪导弹”同时向下沉降
+			hotBuilder.Add(iter.Key(), iter.Value(), vp.Len)
+			coldBuilder.Add(iter.Key(), iter.Value(), vp.Len)
+		} else if db.zzlHeatmap.IsHotKey(pureKey) {
+			// 正常逻辑：有效热数据上 L98 大巴
+			hotBuilder.Add(iter.Key(), iter.Value(), vp.Len)
 		} else {
-			coldBuilder.Add(iter.Key(), iter.Value(), vp.Len) // 冷数据上 L0 大巴
+			// 正常逻辑：有效冷数据上 L0 大巴
+			coldBuilder.Add(iter.Key(), iter.Value(), vp.Len)
 		}
 	}
 	return coldBuilder, hotBuilder

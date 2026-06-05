@@ -45,9 +45,9 @@ func main() {
 	// ==========================================
 	fmt.Println("\n>>> [阶段 1] 混沌写入与热点培养中 (制造数十万版本冲突)...")
 
-	const totalOps = 1000000
-	const hotKeyCount = 750       // 热数据
-	const coldKeyCount = 10000000 // 冷数据，做背景干扰
+	const totalOps = 100000
+	const hotKeyCount = 750      // 热数据
+	const coldKeyCount = 1000000 // 冷数据，做背景干扰
 
 	// 	const totalOps = 3000000
 	// const hotKeyCount = 1000    // 只有50个热点Key，被疯狂覆写
@@ -65,7 +65,7 @@ func main() {
 		key := []byte(keyStr)
 
 		// 10% 的概率进行删除测试
-		if rand.Intn(100) < 10 {
+		if rand.Intn(100) < 5 {
 			err = db.Update(func(txn *badger.Txn) error {
 				return txn.Delete(key)
 			})
@@ -74,8 +74,13 @@ func main() {
 			}
 			delete(truthMap, keyStr) // 同步删除真理账本
 		} else {
-			paddingBytes := make([]byte, 8192)
-			rand.Read(paddingBytes) // math/rand 直接生成纯随机字节
+			// NOTE:下面生成的是高熵的随机V
+			// paddingBytes := make([]byte, 8192)
+			// rand.Read(paddingBytes) // math/rand 直接生成纯随机字节
+
+			// NOTE:下面生成的是可以高压缩的V
+			paddingBytes := bytes.Repeat([]byte("A"), 8192)
+
 			// 写入操作，Value 必须携带严格的 Version 标记，用于防范幽灵读
 			valStr := fmt.Sprintf("value_payload_version_%d_data_%s", i, paddingBytes)
 			err = db.Update(func(txn *badger.Txn) error {

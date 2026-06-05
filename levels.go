@@ -557,12 +557,15 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 		// BadgerDB 的 levelHandler 提供了 getTotalSize() 方法
 		lmaxSize := s.lastLevel().getTotalSize()
 
-		// 💥 2. 计算动态阈值：Lmax 层的 15%
-		dynamicThreshold := int64(float64(lmaxSize) * 0.15)
+		// 💥 2. 计算动态阈值：Lmax 层的 15% NOTE:2026052800 设置L99层容量大小
+		dynamicThreshold := int64(float64(lmaxSize) * 0.10)
 
 		if dynamicThreshold < (50 << 20) {
 			dynamicThreshold = 50 << 20
 		}
+
+		// fmt.Printf("HotTier L99 is needCheck (当前大小 %d MB)\n,其目标大小为(%d MB)",
+		// 	size/(1<<20), dynamicThreshold/(1<<20))
 
 		if size > dynamicThreshold { // NOTE:更改为L6层(即当前总容量)的20%,符合二八定律
 			targets := s.levelTargets()
@@ -1285,13 +1288,13 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			}
 			bopts.TableSize = targetSize // 这里设置的值会在下面的NewTableBuilder函数内乘以0.95转为tableCapacity并且应用在builder.ReachedCapacity()函数内
 
-			// bopts.BloomFalsePositive = 0.001
-			// bopts.Compression = options.Snappy
+			bopts.BloomFalsePositive = 0.001
+			// bopts.Compression = options.None
 		} else {
 			// 正常的 L0-L6 走原生逻辑
 			bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
-			// bopts.BloomFalsePositive = 0.01
-			// bopts.Compression = options.ZSTD
+			bopts.BloomFalsePositive = 0.01
+			// bopts.Compression = options.Snappy
 		}
 		// zzlHACK:END
 

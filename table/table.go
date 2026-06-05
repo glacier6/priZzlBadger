@@ -593,6 +593,12 @@ func (t *Table) block(idx int, useCache bool) (*Block, error) {
 			t.Fd.Name(), blk.offset, ko.Len())
 	}
 
+	// if t.opt.Compression == options.None {
+	// 	// 使用 Go 的三参数切片表达式 [low : high : max]
+	// 	// 强行将 blk.data 的容量（cap）锁死在它当前的真实长度（len）内！
+	// 	blk.data = blk.data[:len(blk.data):len(blk.data)]
+	// }
+
 	// 注意下面,是从Block的尾部开始一段一段的读取(注意 4 的单位是字节)
 
 	// Read meta data related to block.
@@ -649,6 +655,15 @@ func (t *Table) block(idx int, useCache bool) (*Block, error) {
 
 		// Decrement the block ref if we could not insert it in the cache.
 		// 如果我们无法将块ref插入缓存中，请将其递减。
+		// if t.opt.Compression == options.None {
+		// 	fmt.Println("输出一次None")
+		// 	fmt.Println(key)
+		// 	fmt.Println(blk.size())
+		// } else {
+		// 	fmt.Println("输出一次snap")
+		// 	fmt.Println(key)
+		// 	fmt.Println(blk.size())
+		// }
 		if !t.opt.BlockCache.Set(key, blk, blk.size()) { //NOTE:421 核心操作，将读取到的块设置到块缓存中
 			blk.decrRef()
 		}
@@ -839,6 +854,9 @@ func (t *Table) decompress(b *Block) error {
 	switch t.opt.Compression {
 	case options.None: // 如果没有开启压缩,就直接返回
 		// Nothing to be done here.
+		// zzlHACK:2026052801 badger自身bug修复,因为后续计算size用的cap而不是len,如果不在这里截取,那么cap取到的就是接近16mb的值了!!
+		b.data = b.data[:len(b.data):len(b.data)]
+		// zzlHACK:END
 		return nil
 	case options.Snappy: // 如果是Snappy格式的压缩
 		// Snappy 格式通常在头部包含解压后的长度信息。snappy.DecodedLen 可以精确获取这个长度
