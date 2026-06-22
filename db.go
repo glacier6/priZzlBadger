@@ -530,7 +530,13 @@ func (db *DB) IsClosed() bool {
 	return db.isClosed.Load() == 1
 }
 
+// zzlHACK:4160 暴露 Vlog 的大盘给外部 (测试脚本) 调用
+func (db *DB) VlogStatsToString() string {
+	return db.vlog.StatsToString()
+}
+
 func (db *DB) close() (err error) {
+	db.opt.Infof(db.vlog.StatsToString()) // zzlHACK:4160 输出当前Vlog中数据情况
 	defer db.allocPool.Release()
 
 	db.opt.Debugf("Closing database")

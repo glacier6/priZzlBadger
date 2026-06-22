@@ -1185,3 +1185,75 @@ func (v *vlogThreshold) listenForValueThresholdUpdate() {
 		}
 	}
 }
+
+// zzlHACK:4160 打印所有 Vlog 文件的物理大盘与垃圾占比 (原生 BadgerDB 版)
+func (vlog *valueLog) StatsToString() string {
+	if vlog.opt.InMemory {
+		return "InMemory mode: No Vlog files.\n"
+	}
+
+	vlog.filesLock.RLock()
+	defer vlog.filesLock.RUnlock()
+
+	// 1. 收集垃圾数据统计 (通过 Badger 自带的 Iterate 方法)
+	discardMap := make(map[uint32]int64)
+	if vlog.discardStats != nil {
+		vlog.discardStats.Iterate(func(fid uint64, stats uint64) {
+			discardMap[uint32(fid)] = int64(stats)
+		})
+	}
+	var b strings.Builder
+	b.WriteString("\n=========================================================\n")
+	b.WriteString("📊 关机前 Vlog 物理大盘 (原生 BadgerDB)\n")
+	b.WriteString("=========================================================\n")
+
+	fids := make([]uint32, 0, len(vlog.filesMap))
+	for fid := range vlog.filesMap {
+		fids = append(fids, fid)
+	}
+	// 2. 按 FID 排序，方便观察发车的时间线
+	sort.Slice(fids, func(i, j int) bool { return fids[i] < fids[j] })
+
+	var totalSize, totalDiscard int64
+
+	for _, fid := range fids {
+		lf := vlog.filesMap[fid]
+
+		// 读取文件大小
+		size := lf.size.Load()
+
+		activeMarker := "   "
+		// 拦截活跃文件，读取其真实的写入水位线，避免预分配的 2GB 虚高
+		if fid == vlog.maxFid {
+			activeMarker = "(*)"
+			size = vlog.writableLogOffset.Load()
+		}
+
+		discard := discardMap[fid]
+
+		ratio := float64(0)
+		if size > 0 {
+			ratio = float64(discard) / float64(size) * 100.0
+		}
+
+		totalSize += int64(size)
+		totalDiscard += discard
+
+		b.WriteString(fmt.Sprintf("%s FID: %-10d | Size: %7.2f MB | Discard(垃圾): %7.2f MB | Garbage Ratio: %5.2f%%\n",
+			activeMarker, fid, float64(size)/(1048576), float64(discard)/(1048576), ratio))
+	}
+	b.WriteString("---------------------------------------------------------\n")
+	b.WriteString(fmt.Sprintf("📈 汇总: 共 %d 个 Vlog 文件\n", len(fids)))
+
+	overallRatio := float64(0)
+	if totalSize > 0 {
+		overallRatio = float64(totalDiscard) / float64(totalSize) * 100.0
+	}
+	b.WriteString(fmt.Sprintf("总容量: %.2f MB | 总垃圾: %.2f MB | 整体垃圾率: %.2f%%\n",
+		float64(totalSize)/(1048576), float64(totalDiscard)/(1048576), overallRatio))
+	b.WriteString("=========================================================\n")
+
+	return b.String()
+}
+
+// zzlHACK:END
