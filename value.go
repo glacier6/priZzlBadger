@@ -181,7 +181,11 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 			return errors.Errorf("value log file already marked for deletion fid: %d", fid)
 		}
 	}
+	// zzlHACK:4160 区分冷热Vlog的maxFid用于断言
 	maxFid := vlog.maxFid
+	if isHotVlog(f.fid) {
+		maxFid = vlog.hotMaxFid
+	}
 	y.AssertTruef(f.fid < maxFid, "fid to move: %d. Current max fid: %d", f.fid, maxFid)
 	vlog.filesLock.RUnlock()
 
@@ -1434,16 +1438,22 @@ LOOP:
 			discard, thr, fi.Name())
 		return nil
 	}
-	if fid < vlog.maxFid { //如果fid小于最大的fid
-		// 则代表这个fid是有效的，下面将需要回收的VLOG文件返回
-		vlog.opt.Infof("Found value log max discard fid: %d discard: %d\n", fid, discard)
-		lf, ok := vlog.filesMap[fid] //再次取相应的Vlog文件（可能是为了并发检查）
-		y.AssertTrue(ok)
-		return lf
+	// zzlHACK:4160 冷热分离：热Vlog用hotMaxFid判断，冷Vlog用maxFid判断
+	// 确保不会回收正在接收写入的头部VLOG文件
+	if isHotVlog(fid) {
+		if fid >= vlog.hotMaxFid {
+			return nil // 不能回收正在写入的热Vlog头部
+		}
+	} else {
+		if fid >= vlog.maxFid {
+			return nil // 不能回收正在写入的冷Vlog头部
+		}
 	}
-
-	// Don't randomly pick any value log file.
-	return nil
+	// 则代表这个fid是有效的，下面将需要回收的VLOG文件返回
+	vlog.opt.Infof("Found value log max discard fid: %d discard: %d\n", fid, discard)
+	lf, ok = vlog.filesMap[fid] //再次取相应的Vlog文件（可能是为了并发检查）
+	y.AssertTrue(ok)
+	return lf
 }
 
 func discardEntry(e Entry, vs y.ValueStruct, db *DB) bool {
