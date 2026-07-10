@@ -1288,7 +1288,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			}
 			bopts.TableSize = targetSize // 这里设置的值会在下面的NewTableBuilder函数内乘以0.95转为tableCapacity并且应用在builder.ReachedCapacity()函数内
 
-			bopts.BloomFalsePositive = 0.001
+			bopts.BloomFalsePositive = 0.01
 			// bopts.Compression = options.None
 		} else {
 			// 正常的 L0-L6 走原生逻辑

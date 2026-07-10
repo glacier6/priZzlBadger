@@ -1272,7 +1272,7 @@ func buildFlushTables(iter y.Iterator, dropPrefixes [][]byte, bopts table.Option
 	coldBopts.BloomFalsePositive = 0.01
 	// coldBopts.Compression = options.Snappy
 	hotBopts := bopts
-	hotBopts.BloomFalsePositive = 0.001
+	hotBopts.BloomFalsePositive = 0.01
 	// hotBopts.Compression = options.None
 	coldBuilder := table.NewTableBuilder(coldBopts)
 	hotBuilder := table.NewTableBuilder(hotBopts)
